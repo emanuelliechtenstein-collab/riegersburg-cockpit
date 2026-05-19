@@ -1,0 +1,5 @@
+{
+  "database_url": "postgresql+psycopg2://postgres.kwsnfijzutiuughccfgi:DEIN-SUPABASE-PASSWORT@aws-0-eu-west-1.pooler.supabase.com:6543/postgres?sslmode=require",
+  "folder_path": "/Users/rauby/Desktop/Fortbestand der Riegerbsurg ",
+  "extensions": [".txt", ".md", ".srt", ".vtt", ".docx", ".pdf"]
+}

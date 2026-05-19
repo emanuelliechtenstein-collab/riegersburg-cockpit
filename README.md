@@ -14,6 +14,7 @@ Eine einfache lokale Web-App zur Steuerung eines Sanierungsprogramms mit Förder
 - automatische Backups im Ordner `data/backups/`
 - CSV-Export für Excel/Numbers im Ordner `data/`
 - einfacher Passwortschutz für die gemeinsame Nutzung
+- lokaler Sync-Helfer für Plaud-/Protokolldateien aus einem Mac-Ordner
 
 ## Installation
 
@@ -76,3 +77,13 @@ Die aktuell enthaltenen Startdaten wurden aus den kopierten Riegersburg-Projektu
 - Über den Button **Beispieldaten anlegen** können erste Einträge für den Start erzeugt werden.
 - Die Dringlichkeit wird aus Priorität und Frist berechnet.
 - Der PDF-Export nutzt das Paket `reportlab`, das in `requirements.txt` enthalten ist.
+
+## Mac-Ordner-Sync
+
+Für Protokolle, die laufend auf dem Mac abgelegt werden, gibt es den lokalen Helfer:
+
+```text
+sync_desktop_folder.command
+```
+
+Die Einrichtung ist in `SYNC_SETUP.md` beschrieben. Der Helfer überträgt neue TXT-/Markdown-/SRT-/VTT-/Word-/PDF-Dateien in die Cloud-Datenbank. In der Online-App erscheinen sie danach im Reiter **Synchronisierte Dateien**.

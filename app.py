@@ -85,6 +85,7 @@ CONTACT_COLUMNS = [
 ]
 
 IMPORT_COLUMNS = ["fingerprint", "source_type", "title", "imported_at", "notes"]
+SYNC_COLUMNS = ["fingerprint", "filename", "source_path", "synced_at", "file_type", "content", "status", "notes"]
 
 LEVELS = ["Land", "Bund", "EU", "Stiftung", "Privat"]
 FUNDING_STATUS = ["Idee", "in Prüfung", "Kontakt aufnehmen", "Kontakt aufgenommen", "Antrag in Arbeit", "eingereicht", "bewilligt", "abgelehnt", "pausiert"]
@@ -192,6 +193,8 @@ def ensure_database() -> None:
                 pd.DataFrame(columns=columns).to_sql(table_name, connection, if_exists="replace", index=False)
         if not inspector.has_table("importe"):
             pd.DataFrame(columns=IMPORT_COLUMNS).to_sql("importe", connection, if_exists="replace", index=False)
+        if not inspector.has_table("sync_files"):
+            pd.DataFrame(columns=SYNC_COLUMNS).to_sql("sync_files", connection, if_exists="replace", index=False)
 
         migration_key = "cloud_migrated" if is_cloud_database() else "sqlite_migrated"
         if not settings.get(migration_key):
@@ -279,6 +282,40 @@ def load_imports() -> pd.DataFrame:
     engine = database_engine()
     with engine.connect() as connection:
         return pd.read_sql_query(text('SELECT * FROM "importe" ORDER BY imported_at DESC'), connection, dtype=str).fillna("")
+
+
+def load_synced_files(include_content: bool = False) -> pd.DataFrame:
+    ensure_database()
+    engine = database_engine()
+    selected_columns = "*" if include_content else "fingerprint, filename, source_path, synced_at, file_type, status, notes"
+    with engine.connect() as connection:
+        table = pd.read_sql_query(text(f'SELECT {selected_columns} FROM "sync_files" ORDER BY synced_at DESC'), connection, dtype=str).fillna("")
+    for column in SYNC_COLUMNS:
+        if column not in table.columns and (include_content or column != "content"):
+            table[column] = ""
+    return table
+
+
+def load_synced_file_content(fingerprint: str) -> str:
+    if not fingerprint:
+        return ""
+    ensure_database()
+    engine = database_engine()
+    with engine.connect() as connection:
+        result = connection.execute(text('SELECT content FROM "sync_files" WHERE fingerprint = :fingerprint'), {"fingerprint": fingerprint}).scalar()
+    return str(result or "")
+
+
+def update_synced_file_status(fingerprint: str, status: str, notes: str = "") -> None:
+    if not fingerprint:
+        return
+    ensure_database()
+    engine = database_engine()
+    with engine.begin() as connection:
+        connection.execute(
+            text('UPDATE "sync_files" SET status = :status, notes = :notes WHERE fingerprint = :fingerprint'),
+            {"fingerprint": fingerprint, "status": status, "notes": notes},
+        )
 
 
 def format_date_value(value: object) -> str:
@@ -1016,6 +1053,104 @@ def import_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFr
             st.dataframe(imports[["source_type", "title", "imported_at", "notes"]], width="stretch", hide_index=True)
 
 
+def sync_files_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFrame) -> None:
+    st.subheader("Synchronisierte Dateien vom Mac")
+    st.caption("Hier erscheinen Protokolle, die der lokale Sync-Helfer aus deinem Desktop-Ordner in die Cloud übertragen hat.")
+
+    synced_files = load_synced_files()
+    if synced_files.empty:
+        st.info("Noch keine synchronisierten Dateien gefunden. Starte zuerst den lokalen Sync-Helfer auf deinem Mac.")
+        return
+
+    visible = synced_files.copy()
+    search = st.text_input("Synchronisierte Dateien filtern", placeholder="z. B. Plaud, Wiesenhofer, BDA")
+    if search:
+        mask = visible.apply(lambda row: search.lower() in " ".join(row.astype(str)).lower(), axis=1)
+        visible = visible[mask]
+
+    st.dataframe(
+        visible[["filename", "synced_at", "file_type", "status", "notes"]],
+        width="stretch",
+        hide_index=True,
+    )
+
+    if visible.empty:
+        st.warning("Für diesen Filter wurden keine Dateien gefunden.")
+        return
+
+    selected_fingerprint = st.selectbox(
+        "Datei auswählen",
+        visible["fingerprint"].tolist(),
+        format_func=lambda value: visible.loc[visible["fingerprint"] == value, "filename"].iloc[0],
+    )
+    selected_row = visible[visible["fingerprint"] == selected_fingerprint].iloc[0]
+    selected_content = load_synced_file_content(selected_fingerprint)
+
+    if selected_content:
+        with st.expander("Textvorschau"):
+            st.text_area("Inhalt", selected_content[:12000], height=260, disabled=True)
+    else:
+        st.warning("Diese Datei enthält keinen lesbaren Text. Bitte als TXT, Markdown, SRT oder VTT im Mac-Ordner speichern.")
+
+    owner = st.text_input("Standard-Verantwortlich für diese Datei", value="Projektteam", key="sync_owner")
+    participants = st.text_area("Teilnehmer / Kontext für diese Datei", height=80, key="sync_participants")
+    import_title = str(selected_row.get("filename", "Synchronisierte Datei"))
+    source_path = str(selected_row.get("source_path", ""))
+
+    if st.button("Ausgewählte Datei auswerten", type="primary"):
+        fingerprint = import_fingerprint("Sync-Protokoll", import_title, selected_content, source_path + participants)
+        st.session_state["sync_import_fingerprint"] = fingerprint
+        st.session_state["sync_duplicate"] = import_exists(fingerprint)
+        st.session_state["sync_selected_title"] = import_title
+        st.session_state["sync_selected_file_fingerprint"] = selected_fingerprint
+        if st.session_state["sync_duplicate"]:
+            st.session_state["sync_task_suggestions"] = pd.DataFrame(columns=TASK_COLUMNS)
+            st.session_state["sync_contact_suggestions"] = pd.DataFrame(columns=CONTACT_COLUMNS)
+            st.session_state["sync_summary"] = ""
+        else:
+            sync_tasks = extract_task_suggestions("Sync-Protokoll", import_title, selected_content, owner, funding)
+            sync_contacts = extract_contact_suggestions("Sync-Protokoll", import_title, selected_content, participants=participants)
+            st.session_state["sync_task_suggestions"] = sync_tasks
+            st.session_state["sync_contact_suggestions"] = sync_contacts
+            st.session_state["sync_summary"] = protocol_summary(import_title, date.today().isoformat(), participants, selected_content, sync_tasks)
+
+    if st.session_state.get("sync_duplicate"):
+        st.warning("Diese Datei wurde bereits ausgewertet. Es wurden keine neuen Vorschläge erzeugt.")
+
+    summary = st.session_state.get("sync_summary", "")
+    if summary:
+        st.text_area("Zusammenfassung", summary, height=240)
+        st.download_button(
+            "Zusammenfassung als Markdown herunterladen",
+            summary,
+            file_name=f"sync-auswertung-{date.today().isoformat()}.md",
+            mime="text/markdown",
+        )
+
+    sync_tasks = st.session_state.get("sync_task_suggestions", pd.DataFrame(columns=TASK_COLUMNS))
+    sync_contacts = st.session_state.get("sync_contact_suggestions", pd.DataFrame(columns=CONTACT_COLUMNS))
+
+    if not sync_tasks.empty:
+        edited_sync_tasks = data_editor("Aufgabenvorschläge aus synchronisierter Datei", sync_tasks, TASK_COLUMNS, "sync_tasks_editor", {"Priorität": PRIORITIES, "Status": TASK_STATUS})
+        if st.button("Aufgaben aus synchronisierter Datei speichern"):
+            save_table(TASKS_FILE, append_unique(tasks, edited_sync_tasks, "Aufgabe"), TASK_COLUMNS)
+            record_import(st.session_state.get("sync_import_fingerprint", ""), "Sync-Protokoll", st.session_state.get("sync_selected_title", ""), "Aufgaben gespeichert")
+            update_synced_file_status(st.session_state.get("sync_selected_file_fingerprint", ""), "ausgewertet", "Aufgaben gespeichert")
+            st.success("Aufgaben aus synchronisierter Datei gespeichert.")
+            st.rerun()
+    else:
+        st.info("Noch keine Aufgabenvorschläge. Datei auswählen und auswerten.")
+
+    if not sync_contacts.empty:
+        edited_sync_contacts = data_editor("Kontaktvorschläge aus synchronisierter Datei", sync_contacts, CONTACT_COLUMNS, "sync_contacts_editor", {"Relevanz": RELEVANCE})
+        if st.button("Kontakte aus synchronisierter Datei speichern"):
+            save_table(CONTACTS_FILE, append_unique(contacts, edited_sync_contacts, "Name"), CONTACT_COLUMNS)
+            record_import(st.session_state.get("sync_import_fingerprint", ""), "Sync-Protokoll", st.session_state.get("sync_selected_title", ""), "Kontakte gespeichert")
+            update_synced_file_status(st.session_state.get("sync_selected_file_fingerprint", ""), "ausgewertet", "Kontakte gespeichert")
+            st.success("Kontakte aus synchronisierter Datei gespeichert.")
+            st.rerun()
+
+
 def main() -> None:
     if st is None:
         raise RuntimeError("Streamlit ist nicht installiert. Bitte zuerst `pip install -r requirements.txt` ausführen.")
@@ -1045,7 +1180,7 @@ def main() -> None:
     metric_cols[2].metric("offene Aufgaben", len(open_tasks))
     metric_cols[3].metric("hohe Priorität", len(high_priority))
 
-    tabs = st.tabs(["Überblick", "Förderstellen", "Aufgaben", "Kontakte", "Import", "Dokumente", "Bericht"])
+    tabs = st.tabs(["Überblick", "Förderstellen", "Aufgaben", "Kontakte", "Import", "Synchronisierte Dateien", "Dokumente", "Bericht"])
 
     with tabs[0]:
         left, right = st.columns([1.1, 1])
@@ -1111,6 +1246,9 @@ def main() -> None:
         import_panel(funding, tasks, contacts)
 
     with tabs[5]:
+        sync_files_panel(funding, tasks, contacts)
+
+    with tabs[6]:
         st.subheader("Dokumentenordner")
         st.caption("Hier kann die App direkt auf einen lokalen Ordner zugreifen, solange sie auf diesem Mac läuft.")
 
@@ -1158,7 +1296,7 @@ def main() -> None:
                     mime="application/octet-stream",
                 )
 
-    with tabs[6]:
+    with tabs[7]:
         st.subheader("Kompakter Projektbericht")
         report = markdown_report(funding, tasks, contacts)
         st.text_area("Vorschau", report, height=480)
