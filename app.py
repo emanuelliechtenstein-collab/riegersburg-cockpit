@@ -47,6 +47,7 @@ DB_FILE = DATA_DIR / "riegersburg.db"
 BACKUP_DIR = DATA_DIR / "backups"
 DEFAULT_DOCUMENT_DIR = Path.home() / "Desktop" / "Riegersburg_Cockpit"
 DEFAULT_PASSWORD = "Riegersburg2030"
+DEFAULT_LOGO_FILE = BASE_DIR / "assets" / "logo.png"
 
 FUNDING_COLUMNS = [
     "Name",
@@ -852,10 +853,12 @@ def data_editor(label: str, table: pd.DataFrame, columns: list[str], key: str, s
 def show_header(settings: dict[str, str]) -> None:
     logo_url = settings.get("logo_url", "")
     logo_path = settings.get("logo_path", "")
-    if logo_url or logo_path:
+    default_logo = str(DEFAULT_LOGO_FILE) if DEFAULT_LOGO_FILE.exists() else ""
+    logo_source = logo_url or logo_path or default_logo
+    if logo_source:
         left, right = st.columns([1, 7])
         with left:
-            st.image(logo_url or logo_path, width=110)
+            st.image(logo_source, width=120)
         with right:
             st.title("Riegersburg Sanierungsprogramm")
             st.caption("Gemeinsames Förder- und Aufgaben-Cockpit")
