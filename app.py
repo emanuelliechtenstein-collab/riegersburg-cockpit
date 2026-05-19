@@ -3,12 +3,16 @@ from __future__ import annotations
 import io
 import json
 import hmac
+import hashlib
 import os
 import re
 import shutil
 import sqlite3
 import zipfile
 from datetime import date, datetime
+from email import policy
+from email.parser import BytesParser, Parser
+from email.utils import parseaddr, parsedate_to_datetime
 from pathlib import Path
 
 import pandas as pd
@@ -78,6 +82,8 @@ CONTACT_COLUMNS = [
     "nächste Aktion",
     "Notizen",
 ]
+
+IMPORT_COLUMNS = ["fingerprint", "source_type", "title", "imported_at", "notes"]
 
 LEVELS = ["Land", "Bund", "EU", "Stiftung", "Privat"]
 FUNDING_STATUS = ["Idee", "in Prüfung", "Kontakt aufnehmen", "Kontakt aufgenommen", "Antrag in Arbeit", "eingereicht", "bewilligt", "abgelehnt", "pausiert"]
@@ -183,6 +189,8 @@ def ensure_database() -> None:
         for table_name, columns in [spec for spec in TABLES.values()]:
             if not inspector.has_table(table_name):
                 pd.DataFrame(columns=columns).to_sql(table_name, connection, if_exists="replace", index=False)
+        if not inspector.has_table("importe"):
+            pd.DataFrame(columns=IMPORT_COLUMNS).to_sql("importe", connection, if_exists="replace", index=False)
 
         migration_key = "cloud_migrated" if is_cloud_database() else "sqlite_migrated"
         if not settings.get(migration_key):
@@ -222,6 +230,54 @@ def export_csv_files() -> None:
     for csv_name, (table_name, columns) in TABLES.items():
         table = load_table(DATA_DIR / csv_name, columns)
         table[columns].to_csv(DATA_DIR / csv_name, index=False)
+
+
+def import_fingerprint(source_type: str, title: str, body: str, sender_or_participants: str = "") -> str:
+    normalized = "\n".join(
+        [
+            source_type.strip().lower(),
+            title.strip().lower(),
+            sender_or_participants.strip().lower(),
+            re.sub(r"\s+", " ", body).strip().lower(),
+        ]
+    )
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def import_exists(fingerprint: str) -> bool:
+    ensure_database()
+    engine = database_engine()
+    with engine.connect() as connection:
+        result = connection.execute(text('SELECT COUNT(*) FROM "importe" WHERE fingerprint = :fingerprint'), {"fingerprint": fingerprint}).scalar()
+    return bool(result)
+
+
+def record_import(fingerprint: str, source_type: str, title: str, notes: str = "") -> None:
+    ensure_database()
+    engine = database_engine()
+    row = pd.DataFrame(
+        [
+            {
+                "fingerprint": fingerprint,
+                "source_type": source_type,
+                "title": title,
+                "imported_at": datetime.now().isoformat(timespec="seconds"),
+                "notes": notes,
+            }
+        ],
+        columns=IMPORT_COLUMNS,
+    )
+    with engine.begin() as connection:
+        existing = connection.execute(text('SELECT COUNT(*) FROM "importe" WHERE fingerprint = :fingerprint'), {"fingerprint": fingerprint}).scalar()
+        if not existing:
+            row.to_sql("importe", connection, if_exists="append", index=False)
+
+
+def load_imports() -> pd.DataFrame:
+    ensure_database()
+    engine = database_engine()
+    with engine.connect() as connection:
+        return pd.read_sql_query(text('SELECT * FROM "importe" ORDER BY imported_at DESC'), connection, dtype=str).fillna("")
 
 
 def format_date_value(value: object) -> str:
@@ -465,6 +521,58 @@ def extract_contact_suggestions(source_type: str, title: str, body: str, sender_
     return pd.DataFrame(rows, columns=CONTACT_COLUMNS)
 
 
+def read_uploaded_text(uploaded_file) -> str:
+    content = uploaded_file.getvalue()
+    for encoding in ["utf-8", "utf-8-sig", "latin-1"]:
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return content.decode("utf-8", errors="ignore")
+
+
+def parse_raw_email(raw_text: str, uploaded_file=None) -> dict[str, str]:
+    if uploaded_file is not None and uploaded_file.name.lower().endswith(".eml"):
+        message = BytesParser(policy=policy.default).parsebytes(uploaded_file.getvalue())
+    else:
+        message = Parser(policy=policy.default).parsestr(raw_text)
+
+    subject = str(message.get("subject", "") or "")
+    sender_name, sender_email = parseaddr(str(message.get("from", "") or ""))
+    raw_date = str(message.get("date", "") or "")
+    mail_date = ""
+    if raw_date:
+        try:
+            mail_date = parsedate_to_datetime(raw_date).date().isoformat()
+        except (TypeError, ValueError):
+            mail_date = ""
+
+    body = ""
+    if message.is_multipart():
+        for part in message.walk():
+            content_type = part.get_content_type()
+            disposition = str(part.get("content-disposition", "")).lower()
+            if content_type == "text/plain" and "attachment" not in disposition:
+                body = part.get_content()
+                break
+    else:
+        try:
+            body = message.get_content()
+        except Exception:
+            body = raw_text
+
+    if not subject and not sender_email and not body.strip():
+        body = raw_text
+
+    return {
+        "subject": subject,
+        "sender_name": sender_name,
+        "sender_email": sender_email,
+        "date": mail_date,
+        "body": str(body or raw_text),
+    }
+
+
 def append_unique(existing: pd.DataFrame, additions: pd.DataFrame, key_column: str) -> pd.DataFrame:
     if additions.empty:
         return existing.copy()
@@ -679,6 +787,24 @@ def sidebar_admin(settings: dict[str, str]) -> None:
         st.write("Datenbank: `data/riegersburg.db`")
     st.write("Backups: `data/backups/`")
 
+    with st.expander("Logo"):
+        logo_url = st.text_input("Logo-URL", value=settings.get("logo_url", ""), placeholder="https://.../logo.png")
+        local_logo = st.file_uploader("Logo lokal hochladen", type=["png", "jpg", "jpeg"], key="logo_upload")
+        if st.button("Logo speichern"):
+            if local_logo is not None:
+                logo_dir = DATA_DIR / "assets"
+                logo_dir.mkdir(exist_ok=True)
+                suffix = Path(local_logo.name).suffix.lower() or ".png"
+                logo_path = logo_dir / f"logo{suffix}"
+                logo_path.write_bytes(local_logo.getvalue())
+                settings["logo_path"] = str(logo_path)
+                settings["logo_url"] = ""
+            else:
+                settings["logo_url"] = logo_url
+                settings.pop("logo_path", None)
+            save_settings(settings)
+            st.success("Logo gespeichert.")
+
     with st.expander("Passwort ändern"):
         if secret_value("app_password"):
             st.info("In der Cloud wird das Passwort über die App-Secrets geändert.")
@@ -723,6 +849,21 @@ def data_editor(label: str, table: pd.DataFrame, columns: list[str], key: str, s
     )
 
 
+def show_header(settings: dict[str, str]) -> None:
+    logo_url = settings.get("logo_url", "")
+    logo_path = settings.get("logo_path", "")
+    if logo_url or logo_path:
+        left, right = st.columns([1, 7])
+        with left:
+            st.image(logo_url or logo_path, width=110)
+        with right:
+            st.title("Riegersburg Sanierungsprogramm")
+            st.caption("Gemeinsames Förder- und Aufgaben-Cockpit")
+    else:
+        st.title("Riegersburg Sanierungsprogramm")
+        st.caption("Gemeinsames Förder- und Aufgaben-Cockpit")
+
+
 def import_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFrame) -> None:
     st.subheader("E-Mails und Protokolle importieren")
     st.caption("Die App erstellt Vorschläge. Gespeichert wird erst, wenn ihr die Vorschläge bestätigt.")
@@ -730,17 +871,42 @@ def import_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFr
     mail_tab, protocol_tab = st.tabs(["E-Mail", "Protokoll / Plaud"])
 
     with mail_tab:
-        sender_name = st.text_input("Absender Name", key="mail_sender_name")
-        sender_email = st.text_input("Absender E-Mail", key="mail_sender_email")
-        subject = st.text_input("Betreff", key="mail_subject")
-        mail_date = st.date_input("Eingangsdatum", value=date.today(), key="mail_date")
-        mail_text = st.text_area("Mailtext", height=260, key="mail_text")
+        uploaded_email = st.file_uploader("E-Mail-Datei hochladen", type=["eml", "txt"], key="mail_upload")
+        raw_mail = st.text_area("Oder komplette E-Mail hier einfügen", height=220, placeholder="Am besten die ganze Mail inkl. Von/From, Betreff/Subject und Datum einfügen.", key="mail_raw")
+        with st.expander("Felder bei Bedarf manuell ergänzen"):
+            sender_name = st.text_input("Absender Name", key="mail_sender_name")
+            sender_email = st.text_input("Absender E-Mail", key="mail_sender_email")
+            subject = st.text_input("Betreff", key="mail_subject")
+            mail_date = st.date_input("Eingangsdatum", value=date.today(), key="mail_date")
         owner = st.text_input("Standard-Verantwortlich", value="Sonja Liechtenstein / Emanuel Liechtenstein", key="mail_owner")
 
         if st.button("E-Mail auswerten", type="primary"):
-            title = subject or f"Mail vom {mail_date.isoformat()}"
-            st.session_state["mail_task_suggestions"] = extract_task_suggestions("E-Mail", title, mail_text, owner, funding)
-            st.session_state["mail_contact_suggestions"] = extract_contact_suggestions("E-Mail", title, mail_text, sender_name, sender_email)
+            raw_text = read_uploaded_text(uploaded_email) if uploaded_email is not None else raw_mail
+            parsed_mail = parse_raw_email(raw_text, uploaded_email)
+            final_subject = subject or parsed_mail["subject"] or f"Mail vom {mail_date.isoformat()}"
+            final_sender_name = sender_name or parsed_mail["sender_name"]
+            final_sender_email = sender_email or parsed_mail["sender_email"]
+            mail_body = parsed_mail["body"] or raw_text
+            fingerprint = import_fingerprint("E-Mail", final_subject, mail_body, final_sender_email or final_sender_name)
+            st.session_state["mail_fingerprint"] = fingerprint
+            st.session_state["mail_duplicate"] = import_exists(fingerprint)
+            if st.session_state["mail_duplicate"]:
+                st.session_state["mail_task_suggestions"] = pd.DataFrame(columns=TASK_COLUMNS)
+                st.session_state["mail_contact_suggestions"] = pd.DataFrame(columns=CONTACT_COLUMNS)
+            else:
+                st.session_state["mail_task_suggestions"] = extract_task_suggestions("E-Mail", final_subject, mail_body, owner, funding)
+                st.session_state["mail_contact_suggestions"] = extract_contact_suggestions("E-Mail", final_subject, mail_body, final_sender_name, final_sender_email)
+            st.session_state["mail_detected"] = {
+                "Betreff": final_subject,
+                "Absender": final_sender_name,
+                "E-Mail": final_sender_email,
+                "Datum": parsed_mail["date"] or mail_date.isoformat(),
+            }
+
+        if st.session_state.get("mail_detected"):
+            st.write("Erkannt:", st.session_state["mail_detected"])
+        if st.session_state.get("mail_duplicate"):
+            st.warning("Diese E-Mail wurde bereits importiert. Es wurden keine neuen Vorschläge erzeugt.")
 
         suggested_tasks = st.session_state.get("mail_task_suggestions", pd.DataFrame(columns=TASK_COLUMNS))
         suggested_contacts = st.session_state.get("mail_contact_suggestions", pd.DataFrame(columns=CONTACT_COLUMNS))
@@ -749,38 +915,62 @@ def import_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFr
             edited_tasks = data_editor("Aufgabenvorschläge aus E-Mail", suggested_tasks, TASK_COLUMNS, "mail_tasks_editor", {"Priorität": PRIORITIES, "Status": TASK_STATUS})
             if st.button("Aufgabenvorschläge speichern"):
                 save_table(TASKS_FILE, append_unique(tasks, edited_tasks, "Aufgabe"), TASK_COLUMNS)
+                record_import(st.session_state.get("mail_fingerprint", ""), "E-Mail", st.session_state.get("mail_detected", {}).get("Betreff", ""), "Aufgaben gespeichert")
                 st.success("Aufgaben aus E-Mail gespeichert.")
                 st.rerun()
         else:
-            st.info("Noch keine Aufgabenvorschläge. Mailtext einfügen und auswerten.")
+            st.info("Noch keine Aufgabenvorschläge. E-Mail-Datei hochladen oder komplette Mail einfügen und auswerten.")
 
         if not suggested_contacts.empty:
             edited_contacts = data_editor("Kontaktvorschläge aus E-Mail", suggested_contacts, CONTACT_COLUMNS, "mail_contacts_editor", {"Relevanz": RELEVANCE})
             if st.button("Kontaktvorschläge speichern"):
                 save_table(CONTACTS_FILE, append_unique(contacts, edited_contacts, "Name"), CONTACT_COLUMNS)
+                record_import(st.session_state.get("mail_fingerprint", ""), "E-Mail", st.session_state.get("mail_detected", {}).get("Betreff", ""), "Kontakte gespeichert")
                 st.success("Kontakte aus E-Mail gespeichert.")
                 st.rerun()
 
     with protocol_tab:
-        protocol_title = st.text_input("Protokolltitel", key="protocol_title")
+        protocol_title = st.text_input("Protokolltitel für eingefügten Text", key="protocol_title")
         protocol_date = st.date_input("Besprechungsdatum", value=date.today(), key="protocol_date")
         participants = st.text_area("Teilnehmer", height=90, placeholder="Namen durch Komma oder Zeilenumbruch trennen", key="protocol_participants")
-        uploaded_protocol = st.file_uploader("Plaud-/Protokolldatei hochladen", type=["txt", "md", "srt", "vtt"], key="protocol_upload")
-        protocol_text = st.text_area("Protokolltext / Plaud-Transkript", height=300, key="protocol_text")
+        uploaded_protocols = st.file_uploader("Plaud-/Protokolldateien hochladen", type=["txt", "md", "srt", "vtt"], accept_multiple_files=True, key="protocol_upload")
+        protocol_text = st.text_area("Oder Protokolltext / Plaud-Transkript einfügen", height=260, key="protocol_text")
         protocol_owner = st.text_input("Standard-Verantwortlich", value="Projektteam", key="protocol_owner")
 
-        if uploaded_protocol is not None:
-            try:
-                protocol_text = uploaded_protocol.read().decode("utf-8")
-            except UnicodeDecodeError:
-                protocol_text = uploaded_protocol.getvalue().decode("latin-1", errors="ignore")
-            st.text_area("Gelesener Dateiinhalt", protocol_text, height=180, key="protocol_file_preview")
+        protocol_sources = []
+        for uploaded_protocol in uploaded_protocols:
+            file_text = read_uploaded_text(uploaded_protocol)
+            protocol_sources.append((uploaded_protocol.name, file_text))
+        if protocol_text.strip():
+            protocol_sources.append((protocol_title or f"Protokoll {protocol_date.isoformat()}", protocol_text))
+        if protocol_sources:
+            st.caption(f"{len(protocol_sources)} Protokollquelle(n) bereit zur Auswertung.")
 
         if st.button("Protokoll auswerten", type="primary"):
-            title = protocol_title or f"Protokoll {protocol_date.isoformat()}"
-            st.session_state["protocol_task_suggestions"] = extract_task_suggestions("Protokoll", title, protocol_text, protocol_owner, funding)
-            st.session_state["protocol_contact_suggestions"] = extract_contact_suggestions("Protokoll", title, protocol_text, participants=participants)
-            st.session_state["protocol_summary"] = protocol_summary(title, protocol_date.isoformat(), participants, protocol_text, st.session_state["protocol_task_suggestions"])
+            all_tasks = []
+            all_contacts = []
+            summaries = []
+            duplicate_titles = []
+            fingerprints = []
+            for source_title, source_text in protocol_sources:
+                fingerprint = import_fingerprint("Protokoll", source_title, source_text, participants)
+                if import_exists(fingerprint):
+                    duplicate_titles.append(source_title)
+                    continue
+                fingerprints.append((fingerprint, source_title))
+                tasks_for_source = extract_task_suggestions("Protokoll", source_title, source_text, protocol_owner, funding)
+                contacts_for_source = extract_contact_suggestions("Protokoll", source_title, source_text, participants=participants)
+                all_tasks.append(tasks_for_source)
+                all_contacts.append(contacts_for_source)
+                summaries.append(protocol_summary(source_title, protocol_date.isoformat(), participants, source_text, tasks_for_source))
+            st.session_state["protocol_fingerprints"] = fingerprints
+            st.session_state["protocol_duplicates"] = duplicate_titles
+            st.session_state["protocol_task_suggestions"] = pd.concat(all_tasks, ignore_index=True).drop_duplicates(subset=["Aufgabe"], keep="last") if all_tasks else pd.DataFrame(columns=TASK_COLUMNS)
+            st.session_state["protocol_contact_suggestions"] = pd.concat(all_contacts, ignore_index=True).drop_duplicates(subset=["Name"], keep="last") if all_contacts else pd.DataFrame(columns=CONTACT_COLUMNS)
+            st.session_state["protocol_summary"] = "\n\n---\n\n".join(summaries)
+
+        if st.session_state.get("protocol_duplicates"):
+            st.warning("Bereits importiert: " + ", ".join(st.session_state["protocol_duplicates"]))
 
         protocol_tasks = st.session_state.get("protocol_task_suggestions", pd.DataFrame(columns=TASK_COLUMNS))
         protocol_contacts = st.session_state.get("protocol_contact_suggestions", pd.DataFrame(columns=CONTACT_COLUMNS))
@@ -799,6 +989,8 @@ def import_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFr
             edited_protocol_tasks = data_editor("Aufgabenvorschläge aus Protokoll", protocol_tasks, TASK_COLUMNS, "protocol_tasks_editor", {"Priorität": PRIORITIES, "Status": TASK_STATUS})
             if st.button("Aufgaben aus Protokoll speichern"):
                 save_table(TASKS_FILE, append_unique(tasks, edited_protocol_tasks, "Aufgabe"), TASK_COLUMNS)
+                for fingerprint, source_title in st.session_state.get("protocol_fingerprints", []):
+                    record_import(fingerprint, "Protokoll", source_title, "Aufgaben gespeichert")
                 st.success("Aufgaben aus Protokoll gespeichert.")
                 st.rerun()
         else:
@@ -808,8 +1000,17 @@ def import_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFr
             edited_protocol_contacts = data_editor("Kontaktvorschläge aus Protokoll", protocol_contacts, CONTACT_COLUMNS, "protocol_contacts_editor", {"Relevanz": RELEVANCE})
             if st.button("Kontakte aus Protokoll speichern"):
                 save_table(CONTACTS_FILE, append_unique(contacts, edited_protocol_contacts, "Name"), CONTACT_COLUMNS)
+                for fingerprint, source_title in st.session_state.get("protocol_fingerprints", []):
+                    record_import(fingerprint, "Protokoll", source_title, "Kontakte gespeichert")
                 st.success("Kontakte aus Protokoll gespeichert.")
                 st.rerun()
+
+    with st.expander("Import-Historie"):
+        imports = load_imports()
+        if imports.empty:
+            st.info("Noch keine Importe gespeichert.")
+        else:
+            st.dataframe(imports[["source_type", "title", "imported_at", "notes"]], width="stretch", hide_index=True)
 
 
 def main() -> None:
@@ -826,8 +1027,7 @@ def main() -> None:
     tasks = load_table(TASKS_FILE, TASK_COLUMNS)
     contacts = load_table(CONTACTS_FILE, CONTACT_COLUMNS)
 
-    st.title("Riegersburg Sanierungsprogramm")
-    st.caption("Lokales Team-Cockpit mit SQLite-Speicherung, Backups und Dokumentenordner")
+    show_header(settings)
 
     with st.sidebar:
         sidebar_admin(settings)
