@@ -4,6 +4,7 @@ import io
 import json
 import hmac
 import os
+import re
 import shutil
 import sqlite3
 import zipfile
@@ -311,6 +312,185 @@ def scan_documents(folder: Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def clean_import_line(line: str) -> str:
+    line = re.sub(r"^\s*[-*•\d.)\]]+\s*", "", line.strip())
+    return re.sub(r"\s+", " ", line).strip()
+
+
+def extract_deadline(text_value: str) -> str:
+    patterns = [
+        r"\b(\d{4}-\d{2}-\d{2})\b",
+        r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b",
+        r"\b(\d{1,2})\.(\d{1,2})\.(\d{2})\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text_value)
+        if not match:
+            continue
+        if len(match.groups()) == 1:
+            return match.group(1)
+        day, month, year = match.groups()
+        if len(year) == 2:
+            year = "20" + year
+        return f"{year}-{int(month):02d}-{int(day):02d}"
+    return ""
+
+
+def guess_priority(text_value: str) -> str:
+    lowered = text_value.lower()
+    if any(word in lowered for word in ["dringend", "sofort", "kritisch", "frist", "bis morgen", "deadline", "eilt"]):
+        return "hoch"
+    if any(word in lowered for word in ["prüfen", "klären", "vorbereiten", "nachfassen", "kontakt", "einreichen"]):
+        return "mittel"
+    return "niedrig"
+
+
+def guess_funding_reference(text_value: str, funding: pd.DataFrame) -> str:
+    lowered = text_value.lower()
+    for _, row in funding.iterrows():
+        name = str(row.get("Name", ""))
+        if name and name.lower() in lowered:
+            return name
+    references = [
+        ("Bundesdenkmalamt", "Bundesdenkmalamt - Bauaufnahme / Befundung"),
+        ("BDA", "Bundesdenkmalamt - Bauaufnahme / Befundung"),
+        ("ÖROK", "EFRE / Operationelles Programm 2028-2034"),
+        ("EFRE", "EFRE / Operationelles Programm 2028-2034"),
+        ("Operationelles Programm", "EFRE / Operationelles Programm 2028-2034"),
+        ("LIFE", "LIFE-Programm"),
+        ("LEADER", "LEADER"),
+        ("Interreg", "Interreg"),
+        ("Totschnig", "Bund / BML - ländliche Entwicklung und Kulturerbe"),
+        ("Landwirtschaftsministerium", "Bund / BML - ländliche Entwicklung und Kulturerbe"),
+        ("Schrägaufzug", "WIGA / SFG - Schrägaufzug"),
+    ]
+    for keyword, reference in references:
+        if keyword.lower() in lowered:
+            return reference
+    return ""
+
+
+def extract_task_suggestions(source_type: str, title: str, body: str, owner: str, funding: pd.DataFrame) -> pd.DataFrame:
+    action_words = [
+        "bitte",
+        "soll",
+        "muss",
+        "müssen",
+        "klären",
+        "prüfen",
+        "vorbereiten",
+        "nachfassen",
+        "kontakt",
+        "einreichen",
+        "erstellen",
+        "übermitteln",
+        "abstimmen",
+        "entscheiden",
+        "organisieren",
+        "termin",
+        "nächste",
+        "to do",
+        "todo",
+        "action",
+    ]
+    rows = []
+    seen = set()
+    for raw_line in body.splitlines():
+        line = clean_import_line(raw_line)
+        if len(line) < 12:
+            continue
+        lowered = line.lower()
+        bullet_like = bool(re.match(r"^\s*[-*•\d.)\]]+", raw_line))
+        if not bullet_like and not any(word in lowered for word in action_words):
+            continue
+        task_text = line[:220]
+        if task_text.lower() in seen:
+            continue
+        seen.add(task_text.lower())
+        rows.append(
+            {
+                "Aufgabe": task_text,
+                "Verantwortlich": owner,
+                "Priorität": guess_priority(line),
+                "Status": "offen",
+                "Frist": extract_deadline(line),
+                "Bezug zu Förderstelle": guess_funding_reference(line, funding),
+                "Notizen": f"Import aus {source_type}: {title}".strip(),
+            }
+        )
+    return pd.DataFrame(rows, columns=TASK_COLUMNS)
+
+
+def extract_contact_suggestions(source_type: str, title: str, body: str, sender_name: str = "", sender_email: str = "", participants: str = "") -> pd.DataFrame:
+    rows = []
+    seen = set()
+
+    def add_contact(name: str, email: str = "", note: str = "") -> None:
+        clean_name = clean_import_line(name).strip(" ,;")
+        if not clean_name and email:
+            clean_name = email.split("@")[0]
+        if len(clean_name) < 3:
+            return
+        key = (clean_name.lower(), email.lower())
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append(
+            {
+                "Name": clean_name,
+                "Organisation": "",
+                "Funktion": "",
+                "E-Mail": email,
+                "Telefon": "",
+                "Relevanz": "mittel",
+                "letzte Kontaktaufnahme": date.today().isoformat(),
+                "nächste Aktion": "",
+                "Notizen": note or f"Import aus {source_type}: {title}",
+            }
+        )
+
+    if sender_name or sender_email:
+        add_contact(sender_name, sender_email, f"Absender aus {source_type}: {title}")
+
+    for email in sorted(set(re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", body))):
+        add_contact("", email, f"Im Text gefunden: {title}")
+
+    person_pattern = r"\b(?:Dr\.|Mag\.|DI|Dipl\.-Ing\.|LH|BM)\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß.-]+(?:\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß.-]+)?"
+    for name in sorted(set(re.findall(person_pattern, body + "\n" + participants))):
+        add_contact(name, "", f"Im Text/Teilnehmerkreis gefunden: {title}")
+
+    for participant in re.split(r"[,;\n]", participants):
+        add_contact(participant, "", f"Teilnehmer aus Protokoll: {title}")
+
+    return pd.DataFrame(rows, columns=CONTACT_COLUMNS)
+
+
+def append_unique(existing: pd.DataFrame, additions: pd.DataFrame, key_column: str) -> pd.DataFrame:
+    if additions.empty:
+        return existing.copy()
+    combined = pd.concat([existing, additions], ignore_index=True).fillna("")
+    return combined.drop_duplicates(subset=[key_column], keep="last")
+
+
+def protocol_summary(title: str, protocol_date: str, participants: str, body: str, tasks: pd.DataFrame) -> str:
+    lines = [
+        f"# Protokollauswertung: {title or 'ohne Titel'}",
+        "",
+        f"Datum: {protocol_date or date.today().isoformat()}",
+        f"Teilnehmer: {participants or 'nicht angegeben'}",
+        "",
+        "## Erkannte Aufgaben",
+        "",
+    ]
+    if tasks.empty:
+        lines.append("Keine Aufgaben automatisch erkannt.")
+    else:
+        for _, row in tasks.iterrows():
+            lines.append(f"- {row['Aufgabe']} | verantwortlich: {row['Verantwortlich']} | Frist: {row['Frist']}")
+    lines.extend(["", "## Textauszug", "", body[:2500]])
+    return "\n".join(lines)
+
+
 def markdown_report(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFrame) -> str:
     urgent_tasks = add_urgency(tasks).head(8)
     open_tasks = tasks[tasks["Status"].str.lower() != "erledigt"] if not tasks.empty else tasks
@@ -543,6 +723,95 @@ def data_editor(label: str, table: pd.DataFrame, columns: list[str], key: str, s
     )
 
 
+def import_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFrame) -> None:
+    st.subheader("E-Mails und Protokolle importieren")
+    st.caption("Die App erstellt Vorschläge. Gespeichert wird erst, wenn ihr die Vorschläge bestätigt.")
+
+    mail_tab, protocol_tab = st.tabs(["E-Mail", "Protokoll / Plaud"])
+
+    with mail_tab:
+        sender_name = st.text_input("Absender Name", key="mail_sender_name")
+        sender_email = st.text_input("Absender E-Mail", key="mail_sender_email")
+        subject = st.text_input("Betreff", key="mail_subject")
+        mail_date = st.date_input("Eingangsdatum", value=date.today(), key="mail_date")
+        mail_text = st.text_area("Mailtext", height=260, key="mail_text")
+        owner = st.text_input("Standard-Verantwortlich", value="Sonja Liechtenstein / Emanuel Liechtenstein", key="mail_owner")
+
+        if st.button("E-Mail auswerten", type="primary"):
+            title = subject or f"Mail vom {mail_date.isoformat()}"
+            st.session_state["mail_task_suggestions"] = extract_task_suggestions("E-Mail", title, mail_text, owner, funding)
+            st.session_state["mail_contact_suggestions"] = extract_contact_suggestions("E-Mail", title, mail_text, sender_name, sender_email)
+
+        suggested_tasks = st.session_state.get("mail_task_suggestions", pd.DataFrame(columns=TASK_COLUMNS))
+        suggested_contacts = st.session_state.get("mail_contact_suggestions", pd.DataFrame(columns=CONTACT_COLUMNS))
+
+        if not suggested_tasks.empty:
+            edited_tasks = data_editor("Aufgabenvorschläge aus E-Mail", suggested_tasks, TASK_COLUMNS, "mail_tasks_editor", {"Priorität": PRIORITIES, "Status": TASK_STATUS})
+            if st.button("Aufgabenvorschläge speichern"):
+                save_table(TASKS_FILE, append_unique(tasks, edited_tasks, "Aufgabe"), TASK_COLUMNS)
+                st.success("Aufgaben aus E-Mail gespeichert.")
+                st.rerun()
+        else:
+            st.info("Noch keine Aufgabenvorschläge. Mailtext einfügen und auswerten.")
+
+        if not suggested_contacts.empty:
+            edited_contacts = data_editor("Kontaktvorschläge aus E-Mail", suggested_contacts, CONTACT_COLUMNS, "mail_contacts_editor", {"Relevanz": RELEVANCE})
+            if st.button("Kontaktvorschläge speichern"):
+                save_table(CONTACTS_FILE, append_unique(contacts, edited_contacts, "Name"), CONTACT_COLUMNS)
+                st.success("Kontakte aus E-Mail gespeichert.")
+                st.rerun()
+
+    with protocol_tab:
+        protocol_title = st.text_input("Protokolltitel", key="protocol_title")
+        protocol_date = st.date_input("Besprechungsdatum", value=date.today(), key="protocol_date")
+        participants = st.text_area("Teilnehmer", height=90, placeholder="Namen durch Komma oder Zeilenumbruch trennen", key="protocol_participants")
+        uploaded_protocol = st.file_uploader("Plaud-/Protokolldatei hochladen", type=["txt", "md", "srt", "vtt"], key="protocol_upload")
+        protocol_text = st.text_area("Protokolltext / Plaud-Transkript", height=300, key="protocol_text")
+        protocol_owner = st.text_input("Standard-Verantwortlich", value="Projektteam", key="protocol_owner")
+
+        if uploaded_protocol is not None:
+            try:
+                protocol_text = uploaded_protocol.read().decode("utf-8")
+            except UnicodeDecodeError:
+                protocol_text = uploaded_protocol.getvalue().decode("latin-1", errors="ignore")
+            st.text_area("Gelesener Dateiinhalt", protocol_text, height=180, key="protocol_file_preview")
+
+        if st.button("Protokoll auswerten", type="primary"):
+            title = protocol_title or f"Protokoll {protocol_date.isoformat()}"
+            st.session_state["protocol_task_suggestions"] = extract_task_suggestions("Protokoll", title, protocol_text, protocol_owner, funding)
+            st.session_state["protocol_contact_suggestions"] = extract_contact_suggestions("Protokoll", title, protocol_text, participants=participants)
+            st.session_state["protocol_summary"] = protocol_summary(title, protocol_date.isoformat(), participants, protocol_text, st.session_state["protocol_task_suggestions"])
+
+        protocol_tasks = st.session_state.get("protocol_task_suggestions", pd.DataFrame(columns=TASK_COLUMNS))
+        protocol_contacts = st.session_state.get("protocol_contact_suggestions", pd.DataFrame(columns=CONTACT_COLUMNS))
+        summary = st.session_state.get("protocol_summary", "")
+
+        if summary:
+            st.text_area("Protokoll-Zusammenfassung", summary, height=260)
+            st.download_button(
+                "Zusammenfassung als Markdown herunterladen",
+                summary,
+                file_name=f"protokollauswertung-{date.today().isoformat()}.md",
+                mime="text/markdown",
+            )
+
+        if not protocol_tasks.empty:
+            edited_protocol_tasks = data_editor("Aufgabenvorschläge aus Protokoll", protocol_tasks, TASK_COLUMNS, "protocol_tasks_editor", {"Priorität": PRIORITIES, "Status": TASK_STATUS})
+            if st.button("Aufgaben aus Protokoll speichern"):
+                save_table(TASKS_FILE, append_unique(tasks, edited_protocol_tasks, "Aufgabe"), TASK_COLUMNS)
+                st.success("Aufgaben aus Protokoll gespeichert.")
+                st.rerun()
+        else:
+            st.info("Noch keine Aufgabenvorschläge. Protokolltext einfügen oder Plaud-Datei hochladen und auswerten.")
+
+        if not protocol_contacts.empty:
+            edited_protocol_contacts = data_editor("Kontaktvorschläge aus Protokoll", protocol_contacts, CONTACT_COLUMNS, "protocol_contacts_editor", {"Relevanz": RELEVANCE})
+            if st.button("Kontakte aus Protokoll speichern"):
+                save_table(CONTACTS_FILE, append_unique(contacts, edited_protocol_contacts, "Name"), CONTACT_COLUMNS)
+                st.success("Kontakte aus Protokoll gespeichert.")
+                st.rerun()
+
+
 def main() -> None:
     if st is None:
         raise RuntimeError("Streamlit ist nicht installiert. Bitte zuerst `pip install -r requirements.txt` ausführen.")
@@ -573,7 +842,7 @@ def main() -> None:
     metric_cols[2].metric("offene Aufgaben", len(open_tasks))
     metric_cols[3].metric("hohe Priorität", len(high_priority))
 
-    tabs = st.tabs(["Überblick", "Förderstellen", "Aufgaben", "Kontakte", "Dokumente", "Bericht"])
+    tabs = st.tabs(["Überblick", "Förderstellen", "Aufgaben", "Kontakte", "Import", "Dokumente", "Bericht"])
 
     with tabs[0]:
         left, right = st.columns([1.1, 1])
@@ -636,6 +905,9 @@ def main() -> None:
             st.success("Kontakte gespeichert.")
 
     with tabs[4]:
+        import_panel(funding, tasks, contacts)
+
+    with tabs[5]:
         st.subheader("Dokumentenordner")
         st.caption("Hier kann die App direkt auf einen lokalen Ordner zugreifen, solange sie auf diesem Mac läuft.")
 
@@ -683,7 +955,7 @@ def main() -> None:
                     mime="application/octet-stream",
                 )
 
-    with tabs[5]:
+    with tabs[6]:
         st.subheader("Kompakter Projektbericht")
         report = markdown_report(funding, tasks, contacts)
         st.text_area("Vorschau", report, height=480)
