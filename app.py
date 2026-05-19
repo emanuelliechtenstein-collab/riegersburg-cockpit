@@ -518,6 +518,8 @@ def extract_task_suggestions(source_type: str, title: str, body: str, owner: str
 def extract_contact_suggestions(source_type: str, title: str, body: str, sender_name: str = "", sender_email: str = "", participants: str = "") -> pd.DataFrame:
     rows = []
     seen = set()
+    clean_title = re.sub(r"\.(docx|pdf|txt|md|srt|vtt)$", "", title, flags=re.IGNORECASE)
+    searchable_text = "\n".join([clean_title, body, participants])
 
     def add_contact(name: str, email: str = "", note: str = "") -> None:
         clean_name = clean_import_line(name).strip(" ,;")
@@ -546,12 +548,18 @@ def extract_contact_suggestions(source_type: str, title: str, body: str, sender_
     if sender_name or sender_email:
         add_contact(sender_name, sender_email, f"Absender aus {source_type}: {title}")
 
-    for email in sorted(set(re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", body))):
+    for email in sorted(set(re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", searchable_text))):
         add_contact("", email, f"Im Text gefunden: {title}")
 
-    person_pattern = r"\b(?:Dr\.|Mag\.|DI|Dipl\.-Ing\.|LH|BM)\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß.-]+(?:\s+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß.-]+)?"
-    for name in sorted(set(re.findall(person_pattern, body + "\n" + participants))):
+    person_pattern = r"\b(?:Frau|Herr)?[ \t]*(?:Dr\.|Mag\.|Mag\.a|DI|Dipl\.-Ing\.|LH|BM)[ \t]+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß-]+(?:[ \t]+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß-]+)?"
+    for name in sorted(set(re.findall(person_pattern, searchable_text))):
         add_contact(name, "", f"Im Text/Teilnehmerkreis gefunden: {title}")
+
+    meeting_partner_pattern = r"\b(?:mit|bei|an|von)[ \t]+((?:Frau|Herr)?[ \t]*(?:Dr\.|Mag\.|Mag\.a|DI|Dipl\.-Ing\.)?[ \t]*[A-ZÄÖÜ][A-Za-zÄÖÜäöüß-]+(?:[ \t]+[A-ZÄÖÜ][A-Za-zÄÖÜäöüß-]+){1,2})"
+    for name in sorted(set(re.findall(meeting_partner_pattern, searchable_text))):
+        if any(stopword in name.lower() for stopword in ["der ", "die ", "das ", "dem ", "den ", "und "]):
+            continue
+        add_contact(name, "", f"Gesprächspartner aus Titel/Text: {title}")
 
     for participant in re.split(r"[,;\n]", participants):
         add_contact(participant, "", f"Teilnehmer aus Protokoll: {title}")
