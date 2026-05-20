@@ -181,20 +181,28 @@ def save_table(path: Path, table: pd.DataFrame, columns: list[str]) -> None:
     output.to_csv(path, index=False)
 
 
+def ensure_table_schema(connection, table_name: str, columns: list[str]) -> None:
+    inspector = inspect(connection)
+    if not inspector.has_table(table_name):
+        pd.DataFrame(columns=columns).to_sql(table_name, connection, if_exists="replace", index=False)
+        return
+
+    existing_columns = {column["name"] for column in inspector.get_columns(table_name)}
+    for column in columns:
+        if column not in existing_columns:
+            connection.execute(text(f'ALTER TABLE "{table_name}" ADD COLUMN "{column}" TEXT'))
+
+
 def ensure_database() -> None:
     BACKUP_DIR.mkdir(exist_ok=True)
     settings = load_settings()
     engine = database_engine()
-    inspector = inspect(engine)
 
     with engine.begin() as connection:
         for table_name, columns in [spec for spec in TABLES.values()]:
-            if not inspector.has_table(table_name):
-                pd.DataFrame(columns=columns).to_sql(table_name, connection, if_exists="replace", index=False)
-        if not inspector.has_table("importe"):
-            pd.DataFrame(columns=IMPORT_COLUMNS).to_sql("importe", connection, if_exists="replace", index=False)
-        if not inspector.has_table("sync_files"):
-            pd.DataFrame(columns=SYNC_COLUMNS).to_sql("sync_files", connection, if_exists="replace", index=False)
+            ensure_table_schema(connection, table_name, columns)
+        ensure_table_schema(connection, "importe", IMPORT_COLUMNS)
+        ensure_table_schema(connection, "sync_files", SYNC_COLUMNS)
 
         migration_key = "cloud_migrated" if is_cloud_database() else "sqlite_migrated"
         if not settings.get(migration_key):
@@ -281,19 +289,27 @@ def load_imports() -> pd.DataFrame:
     ensure_database()
     engine = database_engine()
     with engine.connect() as connection:
-        return pd.read_sql_query(text('SELECT * FROM "importe" ORDER BY imported_at DESC'), connection, dtype=str).fillna("")
+        table = pd.read_sql_query(text('SELECT * FROM "importe"'), connection, dtype=str).fillna("")
+    for column in IMPORT_COLUMNS:
+        if column not in table.columns:
+            table[column] = ""
+    if "imported_at" in table.columns:
+        table = table.sort_values("imported_at", ascending=False)
+    return table[IMPORT_COLUMNS]
 
 
 def load_synced_files(include_content: bool = False) -> pd.DataFrame:
     ensure_database()
     engine = database_engine()
-    selected_columns = "*" if include_content else "fingerprint, filename, source_path, synced_at, file_type, status, notes"
     with engine.connect() as connection:
-        table = pd.read_sql_query(text(f'SELECT {selected_columns} FROM "sync_files" ORDER BY synced_at DESC'), connection, dtype=str).fillna("")
+        table = pd.read_sql_query(text('SELECT * FROM "sync_files"'), connection, dtype=str).fillna("")
     for column in SYNC_COLUMNS:
-        if column not in table.columns and (include_content or column != "content"):
+        if column not in table.columns:
             table[column] = ""
-    return table
+    if "synced_at" in table.columns:
+        table = table.sort_values("synced_at", ascending=False)
+    visible_columns = SYNC_COLUMNS if include_content else [column for column in SYNC_COLUMNS if column != "content"]
+    return table[visible_columns]
 
 
 def load_synced_file_content(fingerprint: str) -> str:
@@ -930,26 +946,34 @@ def import_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFr
 
         if st.button("E-Mail auswerten", type="primary"):
             raw_text = read_uploaded_text(uploaded_email) if uploaded_email is not None else raw_mail
-            parsed_mail = parse_raw_email(raw_text, uploaded_email)
-            final_subject = subject or parsed_mail["subject"] or f"Mail vom {mail_date.isoformat()}"
-            final_sender_name = sender_name or parsed_mail["sender_name"]
-            final_sender_email = sender_email or parsed_mail["sender_email"]
-            mail_body = parsed_mail["body"] or raw_text
-            fingerprint = import_fingerprint("E-Mail", final_subject, mail_body, final_sender_email or final_sender_name)
-            st.session_state["mail_fingerprint"] = fingerprint
-            st.session_state["mail_duplicate"] = import_exists(fingerprint)
-            if st.session_state["mail_duplicate"]:
-                st.session_state["mail_task_suggestions"] = pd.DataFrame(columns=TASK_COLUMNS)
-                st.session_state["mail_contact_suggestions"] = pd.DataFrame(columns=CONTACT_COLUMNS)
+            if not raw_text.strip():
+                st.warning("Bitte zuerst eine E-Mail-Datei hochladen oder den E-Mail-Text einfügen.")
             else:
-                st.session_state["mail_task_suggestions"] = extract_task_suggestions("E-Mail", final_subject, mail_body, owner, funding)
-                st.session_state["mail_contact_suggestions"] = extract_contact_suggestions("E-Mail", final_subject, mail_body, final_sender_name, final_sender_email)
-            st.session_state["mail_detected"] = {
-                "Betreff": final_subject,
-                "Absender": final_sender_name,
-                "E-Mail": final_sender_email,
-                "Datum": parsed_mail["date"] or mail_date.isoformat(),
-            }
+                try:
+                    parsed_mail = parse_raw_email(raw_text, uploaded_email)
+                    final_subject = subject or parsed_mail["subject"] or f"Mail vom {mail_date.isoformat()}"
+                    final_sender_name = sender_name or parsed_mail["sender_name"]
+                    final_sender_email = sender_email or parsed_mail["sender_email"]
+                    mail_body = parsed_mail["body"] or raw_text
+                    fingerprint = import_fingerprint("E-Mail", final_subject, mail_body, final_sender_email or final_sender_name)
+                    st.session_state["mail_fingerprint"] = fingerprint
+                    st.session_state["mail_duplicate"] = import_exists(fingerprint)
+                    if st.session_state["mail_duplicate"]:
+                        st.session_state["mail_task_suggestions"] = pd.DataFrame(columns=TASK_COLUMNS)
+                        st.session_state["mail_contact_suggestions"] = pd.DataFrame(columns=CONTACT_COLUMNS)
+                    else:
+                        st.session_state["mail_task_suggestions"] = extract_task_suggestions("E-Mail", final_subject, mail_body, owner, funding)
+                        st.session_state["mail_contact_suggestions"] = extract_contact_suggestions("E-Mail", final_subject, mail_body, final_sender_name, final_sender_email)
+                    st.session_state["mail_detected"] = {
+                        "Betreff": final_subject,
+                        "Absender": final_sender_name,
+                        "E-Mail": final_sender_email,
+                        "Datum": parsed_mail["date"] or mail_date.isoformat(),
+                    }
+                except Exception as exc:
+                    st.session_state["mail_task_suggestions"] = pd.DataFrame(columns=TASK_COLUMNS)
+                    st.session_state["mail_contact_suggestions"] = pd.DataFrame(columns=CONTACT_COLUMNS)
+                    st.error(f"Diese E-Mail konnte nicht ausgewertet werden: {exc}")
 
         if st.session_state.get("mail_detected"):
             st.write("Erkannt:", st.session_state["mail_detected"])
@@ -1071,10 +1095,16 @@ def sync_files_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.Da
         return
 
     visible = synced_files.copy()
+    show_processed = st.checkbox("Bereits übernommene Dateien anzeigen", value=False)
+    if not show_processed:
+        visible = visible[visible["status"].str.lower() != "ausgewertet"]
+
     search = st.text_input("Synchronisierte Dateien filtern", placeholder="z. B. Plaud, Wiesenhofer, BDA")
     if search:
         mask = visible.apply(lambda row: search.lower() in " ".join(row.astype(str)).lower(), axis=1)
         visible = visible[mask]
+
+    st.caption(f"{len(visible)} offene Datei(en) sichtbar. Bereits übernommene Dateien bleiben über den Schalter erreichbar.")
 
     st.dataframe(
         visible[["filename", "synced_at", "file_type", "status", "notes"]],
@@ -1115,6 +1145,7 @@ def sync_files_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.Da
             st.session_state["sync_task_suggestions"] = pd.DataFrame(columns=TASK_COLUMNS)
             st.session_state["sync_contact_suggestions"] = pd.DataFrame(columns=CONTACT_COLUMNS)
             st.session_state["sync_summary"] = ""
+            update_synced_file_status(selected_fingerprint, "ausgewertet", "Bereits früher übernommen")
         else:
             sync_tasks = extract_task_suggestions("Sync-Protokoll", import_title, selected_content, owner, funding)
             sync_contacts = extract_contact_suggestions("Sync-Protokoll", import_title, selected_content, participants=participants)
