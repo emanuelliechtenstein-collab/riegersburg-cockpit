@@ -269,6 +269,34 @@ def real_tasks(tasks: pd.DataFrame) -> pd.DataFrame:
     return tasks[tasks["Aufgabe"].astype(str).str.strip() != ""].copy()
 
 
+def normalized_column(table: pd.DataFrame, column: str) -> pd.Series:
+    if table.empty or column not in table.columns:
+        return pd.Series(dtype=str)
+    return table[column].astype(str).str.strip().str.lower()
+
+
+def task_data_editor(tasks: pd.DataFrame) -> pd.DataFrame:
+    editable_table = tasks.copy()
+    editable_table.insert(0, "Löschen", False)
+    editable_table["Frist"] = pd.to_datetime(editable_table["Frist"], errors="coerce")
+    edited = st.data_editor(
+        editable_table,
+        num_rows="dynamic",
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "Löschen": st.column_config.CheckboxColumn("Löschen"),
+            "Priorität": st.column_config.SelectboxColumn("Priorität", options=PRIORITIES, required=False),
+            "Status": st.column_config.SelectboxColumn("Status", options=TASK_STATUS, required=False),
+            "Frist": st.column_config.DateColumn("Frist", format="YYYY-MM-DD"),
+        },
+        key="tasks_editor",
+    )
+    if "Löschen" in edited.columns:
+        edited = edited[edited["Löschen"] != True].drop(columns=["Löschen"])
+    return edited[TASK_COLUMNS]
+
+
 def import_fingerprint(source_type: str, title: str, body: str, sender_or_participants: str = "") -> str:
     normalized = "\n".join(
         [
@@ -386,7 +414,7 @@ def parse_date(value: str) -> date | None:
 def urgency_score(row: pd.Series, status_column: str = "Status") -> int:
     priority = str(row.get("Priorität", "")).lower()
     deadline = parse_date(str(row.get("Frist", "")))
-    status = str(row.get(status_column, "")).lower()
+    status = str(row.get(status_column, "")).strip().lower()
     if status in {"erledigt", "bewilligt", "abgelehnt"}:
         return 0
 
@@ -687,9 +715,9 @@ def protocol_summary(title: str, protocol_date: str, participants: str, body: st
 
 
 def markdown_report(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFrame) -> str:
-    urgent_tasks = add_urgency(tasks).head(8)
     tasks = real_tasks(tasks)
-    open_tasks = tasks[tasks["Status"].str.lower() != "erledigt"] if not tasks.empty else tasks
+    urgent_tasks = add_urgency(tasks).head(8)
+    open_tasks = tasks[normalized_column(tasks, "Status") != "erledigt"] if not tasks.empty else tasks
     active_funding = funding[~funding["Status"].str.lower().isin(["bewilligt", "abgelehnt"])] if not funding.empty else funding
 
     lines = [
@@ -1261,8 +1289,10 @@ def main() -> None:
         sidebar_admin(settings)
 
     tasks = real_tasks(tasks)
-    open_tasks = tasks[tasks["Status"].str.lower() != "erledigt"] if not tasks.empty else tasks
-    high_priority = tasks[(tasks["Priorität"].str.lower() == "hoch") & (tasks["Status"].str.lower() != "erledigt")] if not tasks.empty else tasks
+    task_status = normalized_column(tasks, "Status")
+    task_priority = normalized_column(tasks, "Priorität")
+    open_tasks = tasks[task_status != "erledigt"] if not tasks.empty else tasks
+    high_priority = tasks[(task_priority == "hoch") & (task_status != "erledigt")] if not tasks.empty else tasks
     active_funding = funding[~funding["Status"].str.lower().isin(["bewilligt", "abgelehnt"])] if not funding.empty else funding
 
     metric_cols = st.columns(4)
@@ -1311,13 +1341,9 @@ def main() -> None:
             st.rerun()
 
     with tabs[2]:
-        edited = data_editor(
-            "Aufgaben und nächste Schritte verwalten",
-            tasks,
-            TASK_COLUMNS,
-            "tasks_editor",
-            {"Priorität": PRIORITIES, "Status": TASK_STATUS},
-        )
+        st.subheader("Aufgaben und nächste Schritte verwalten")
+        st.caption("Zum Löschen eine Zeile in der Spalte Löschen anhaken und anschließend Aufgaben speichern.")
+        edited = task_data_editor(tasks)
         if st.button("Aufgaben speichern", type="primary"):
             save_table(TASKS_FILE, edited, TASK_COLUMNS)
             st.success("Aufgaben gespeichert.")
