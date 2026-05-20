@@ -807,17 +807,36 @@ def sample_data() -> None:
         )
 
 
+def remember_login_token(configured_password: str) -> str:
+    return hashlib.sha256(f"riegersburg-login:{configured_password}".encode("utf-8")).hexdigest()
+
+
+def get_query_param(name: str) -> str:
+    value = st.query_params.get(name, "")
+    if isinstance(value, list):
+        return value[0] if value else ""
+    return str(value)
+
+
 def check_login(settings: dict[str, str]) -> bool:
     configured_password = secret_value("app_password") or settings.get("app_password", DEFAULT_PASSWORD)
     if st.session_state.get("authenticated"):
         return True
 
+    remember_token = remember_login_token(configured_password)
+    if hmac.compare_digest(get_query_param("zugang"), remember_token):
+        st.session_state["authenticated"] = True
+        return True
+
     st.title("Riegersburg Sanierungsprogramm")
     st.caption("Bitte anmelden, um das gemeinsame Cockpit zu öffnen.")
     password = st.text_input("Passwort", type="password")
+    remember_device = st.checkbox("Auf diesem Gerät merken", value=True)
     if st.button("Anmelden", type="primary"):
         if hmac.compare_digest(password, configured_password):
             st.session_state["authenticated"] = True
+            if remember_device:
+                st.query_params["zugang"] = remember_token
             st.rerun()
         else:
             st.error("Das Passwort stimmt nicht.")
@@ -828,6 +847,12 @@ def check_login(settings: dict[str, str]) -> bool:
 
 def sidebar_admin(settings: dict[str, str]) -> None:
     st.header("Aktionen")
+    if st.button("Abmelden", width="stretch"):
+        st.session_state["authenticated"] = False
+        if "zugang" in st.query_params:
+            del st.query_params["zugang"]
+        st.rerun()
+
     if st.button("Backup erstellen", width="stretch"):
         backup_path = backup_database()
         if backup_path:
