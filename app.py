@@ -165,10 +165,29 @@ def save_settings(settings: dict[str, str]) -> None:
     SETTINGS_FILE.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def clean_table(table: pd.DataFrame, columns: list[str], required_column: str | None = None) -> pd.DataFrame:
+    cleaned = table.copy()
+    for column in columns:
+        if column not in cleaned.columns:
+            cleaned[column] = ""
+    cleaned = cleaned[columns].fillna("")
+    cleaned = cleaned.map(lambda value: value.strip() if isinstance(value, str) else value)
+    non_empty_mask = cleaned.astype(str).apply(lambda row: any(value.strip() for value in row), axis=1)
+    cleaned = cleaned[non_empty_mask]
+    if required_column and required_column in cleaned.columns:
+        cleaned = cleaned[cleaned[required_column].astype(str).str.strip() != ""]
+    return cleaned.reset_index(drop=True)
+
+
 def save_table(path: Path, table: pd.DataFrame, columns: list[str]) -> None:
     ensure_database()
     backup_database()
-    output = table[columns].copy()
+    required_columns = {
+        FUNDING_FILE.name: "Name",
+        TASKS_FILE.name: "Aufgabe",
+        CONTACTS_FILE.name: "Name",
+    }
+    output = clean_table(table, columns, required_columns.get(path.name))
     for column in ["Frist", "letzte Kontaktaufnahme"]:
         if column in output.columns:
             output[column] = output[column].apply(format_date_value)
@@ -242,6 +261,12 @@ def export_csv_files() -> None:
     for csv_name, (table_name, columns) in TABLES.items():
         table = load_table(DATA_DIR / csv_name, columns)
         table[columns].to_csv(DATA_DIR / csv_name, index=False)
+
+
+def real_tasks(tasks: pd.DataFrame) -> pd.DataFrame:
+    if tasks.empty or "Aufgabe" not in tasks.columns:
+        return pd.DataFrame(columns=TASK_COLUMNS)
+    return tasks[tasks["Aufgabe"].astype(str).str.strip() != ""].copy()
 
 
 def import_fingerprint(source_type: str, title: str, body: str, sender_or_participants: str = "") -> str:
@@ -663,6 +688,7 @@ def protocol_summary(title: str, protocol_date: str, participants: str, body: st
 
 def markdown_report(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFrame) -> str:
     urgent_tasks = add_urgency(tasks).head(8)
+    tasks = real_tasks(tasks)
     open_tasks = tasks[tasks["Status"].str.lower() != "erledigt"] if not tasks.empty else tasks
     active_funding = funding[~funding["Status"].str.lower().isin(["bewilligt", "abgelehnt"])] if not funding.empty else funding
 
@@ -1234,8 +1260,9 @@ def main() -> None:
     with st.sidebar:
         sidebar_admin(settings)
 
+    tasks = real_tasks(tasks)
     open_tasks = tasks[tasks["Status"].str.lower() != "erledigt"] if not tasks.empty else tasks
-    high_priority = tasks[tasks["Priorität"].str.lower() == "hoch"] if not tasks.empty else tasks
+    high_priority = tasks[(tasks["Priorität"].str.lower() == "hoch") & (tasks["Status"].str.lower() != "erledigt")] if not tasks.empty else tasks
     active_funding = funding[~funding["Status"].str.lower().isin(["bewilligt", "abgelehnt"])] if not funding.empty else funding
 
     metric_cols = st.columns(4)
@@ -1281,6 +1308,7 @@ def main() -> None:
         if st.button("Förderstellen speichern", type="primary"):
             save_table(FUNDING_FILE, edited, FUNDING_COLUMNS)
             st.success("Förderstellen gespeichert.")
+            st.rerun()
 
     with tabs[2]:
         edited = data_editor(
@@ -1293,6 +1321,7 @@ def main() -> None:
         if st.button("Aufgaben speichern", type="primary"):
             save_table(TASKS_FILE, edited, TASK_COLUMNS)
             st.success("Aufgaben gespeichert.")
+            st.rerun()
 
     with tabs[3]:
         edited = data_editor(
@@ -1305,6 +1334,7 @@ def main() -> None:
         if st.button("Kontakte speichern", type="primary"):
             save_table(CONTACTS_FILE, edited, CONTACT_COLUMNS)
             st.success("Kontakte gespeichert.")
+            st.rerun()
 
     with tabs[4]:
         import_panel(funding, tasks, contacts)
