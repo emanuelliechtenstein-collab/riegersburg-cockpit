@@ -475,9 +475,113 @@ def scan_documents(folder: Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def repair_text_encoding(text_value: str) -> str:
+    replacements = {
+        "Ã¤": "ä",
+        "Ã¶": "ö",
+        "Ã¼": "ü",
+        "Ã„": "Ä",
+        "Ã–": "Ö",
+        "Ãœ": "Ü",
+        "ÃŸ": "ß",
+        "â€“": "-",
+        "â€”": "-",
+        "â€ž": "„",
+        "â€œ": "“",
+        "â€": "”",
+        "â€™": "’",
+    }
+    repaired = str(text_value or "")
+    for broken, fixed in replacements.items():
+        repaired = repaired.replace(broken, fixed)
+    word_replacements = {
+        "gro�": "groß",
+        "Gro�": "Groß",
+        "Gru�": "Gruß",
+        "gru�": "gruß",
+        "Stra�e": "Straße",
+        "stra�e": "straße",
+        "Ma�": "Maß",
+        "ma�": "maß",
+        "au�": "auß",
+        "Au�": "Auß",
+        "Gr��e": "Grüße",
+        "gr��e": "grüße",
+        "Gr��en": "Grüßen",
+        "gr��en": "grüßen",
+    }
+    for broken, fixed in word_replacements.items():
+        repaired = repaired.replace(broken, fixed)
+    repaired = re.sub(r"(?<=[A-Za-zÄÖÜäöü])�(?=[A-Za-zÄÖÜäöü])", "ß", repaired)
+    return repaired
+
+
 def clean_import_line(line: str) -> str:
+    line = repair_text_encoding(line)
     line = re.sub(r"^\s*[-*•\d.)\]]+\s*", "", line.strip())
     return re.sub(r"\s+", " ", line).strip()
+
+
+def split_import_candidates(body: str) -> list[tuple[str, bool]]:
+    candidates = []
+    for raw_line in repair_text_encoding(body).splitlines():
+        if not raw_line.strip():
+            continue
+        bullet_like = bool(re.match(r"^\s*[-*•\d.)\]]+", raw_line))
+        if bullet_like:
+            candidates.append((raw_line, True))
+            continue
+        for sentence in re.split(r"(?<=[.!?])\s+", raw_line.strip()):
+            if sentence:
+                candidates.append((sentence, False))
+    return candidates
+
+
+def task_candidate_is_useful(line: str, bullet_like: bool, action_words: list[str]) -> bool:
+    lowered = line.lower()
+    if len(line) < 12:
+        return False
+    if len(line) > 230 and not bullet_like:
+        return False
+    if len(line.split()) > 34 and not bullet_like:
+        return False
+    soft_noise = [
+        "vielen dank",
+        "herzlichen dank",
+        "mit freundlichen grüßen",
+        "beste grüße",
+        "liebe grüße",
+        "ich hoffe",
+        "zur kenntnis",
+        "anbei",
+        "wie besprochen",
+        "ich freue mich",
+    ]
+    if any(phrase in lowered for phrase in soft_noise):
+        return False
+    strong_patterns = [
+        r"\bbitte\b",
+        r"\bbis\s+\d{1,2}\.",
+        r"\bfrist\b",
+        r"\bnächste[rs]?\s+schritt",
+        r"\bzu\s+klären\b",
+        r"\bzu\s+prüfen\b",
+        r"\bzu\s+übermitteln\b",
+        r"\bunterlagen\s+(?:senden|übermitteln|nachreichen|vorbereiten)\b",
+    ]
+    if any(re.search(pattern, lowered) for pattern in strong_patterns):
+        return True
+    if bullet_like and any(word in lowered for word in action_words):
+        return True
+    return False
+
+
+def shorten_task_text(line: str) -> str:
+    cleaned = clean_import_line(line)
+    first_sentence = re.split(r"(?<=[.!?])\s+", cleaned)[0]
+    if 20 <= len(first_sentence) <= 180:
+        return first_sentence
+    return cleaned[:180].rstrip(" ,.;")
 
 
 def extract_deadline(text_value: str) -> str:
@@ -558,15 +662,11 @@ def extract_task_suggestions(source_type: str, title: str, body: str, owner: str
     ]
     rows = []
     seen = set()
-    for raw_line in body.splitlines():
+    for raw_line, bullet_like in split_import_candidates(body):
         line = clean_import_line(raw_line)
-        if len(line) < 12:
+        if not task_candidate_is_useful(line, bullet_like, action_words):
             continue
-        lowered = line.lower()
-        bullet_like = bool(re.match(r"^\s*[-*•\d.)\]]+", raw_line))
-        if not bullet_like and not any(word in lowered for word in action_words):
-            continue
-        task_text = line[:220]
+        task_text = shorten_task_text(line)
         if task_text.lower() in seen:
             continue
         seen.add(task_text.lower())
@@ -584,17 +684,54 @@ def extract_task_suggestions(source_type: str, title: str, body: str, owner: str
     return pd.DataFrame(rows, columns=TASK_COLUMNS)
 
 
-def extract_contact_suggestions(source_type: str, title: str, body: str, sender_name: str = "", sender_email: str = "", participants: str = "") -> pd.DataFrame:
+def normalize_contact_name(name: str) -> str:
+    normalized = clean_import_line(name).lower()
+    normalized = re.sub(r"\b(frau|herr|dr\.?|mag\.?|mag\.a|di|dipl\.-ing\.?|lh|bm)\b", "", normalized)
+    normalized = re.sub(r"[^a-zäöüß ]", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def existing_contact_keys(existing_contacts: pd.DataFrame | None) -> tuple[set[str], set[str]]:
+    if existing_contacts is None or existing_contacts.empty:
+        return set(), set()
+    names = set()
+    emails = set()
+    for _, row in existing_contacts.fillna("").iterrows():
+        name_key = normalize_contact_name(str(row.get("Name", "")))
+        if name_key:
+            names.add(name_key)
+        email = str(row.get("E-Mail", "")).strip().lower()
+        if email:
+            emails.add(email)
+    return names, emails
+
+
+def extract_contact_suggestions(
+    source_type: str,
+    title: str,
+    body: str,
+    sender_name: str = "",
+    sender_email: str = "",
+    participants: str = "",
+    existing_contacts: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     rows = []
     seen = set()
-    clean_title = re.sub(r"\.(docx|pdf|txt|md|srt|vtt)$", "", title, flags=re.IGNORECASE)
-    searchable_text = "\n".join([clean_title, body, participants])
+    known_names, known_emails = existing_contact_keys(existing_contacts)
+    clean_title = re.sub(r"\.(docx|pdf|txt|md|srt|vtt|eml)$", "", repair_text_encoding(title), flags=re.IGNORECASE)
+    searchable_text = repair_text_encoding("\n".join([clean_title, body, participants]))
 
     def add_contact(name: str, email: str = "", note: str = "") -> None:
         clean_name = clean_import_line(name).strip(" ,;")
         if not clean_name and email:
             clean_name = email.split("@")[0]
         if len(clean_name) < 3:
+            return
+        name_key = normalize_contact_name(clean_name)
+        email_key = email.strip().lower()
+        if name_key and name_key in known_names:
+            return
+        if email_key and email_key in known_emails:
             return
         key = (clean_name.lower(), email.lower())
         if key in seen:
@@ -638,12 +775,12 @@ def extract_contact_suggestions(source_type: str, title: str, body: str, sender_
 
 def read_uploaded_text(uploaded_file) -> str:
     content = uploaded_file.getvalue()
-    for encoding in ["utf-8", "utf-8-sig", "latin-1"]:
+    for encoding in ["utf-8", "utf-8-sig", "cp1252", "latin-1"]:
         try:
-            return content.decode(encoding)
+            return repair_text_encoding(content.decode(encoding))
         except UnicodeDecodeError:
             continue
-    return content.decode("utf-8", errors="ignore")
+    return repair_text_encoding(content.decode("utf-8", errors="ignore"))
 
 
 def parse_raw_email(raw_text: str, uploaded_file=None) -> dict[str, str]:
@@ -652,8 +789,9 @@ def parse_raw_email(raw_text: str, uploaded_file=None) -> dict[str, str]:
     else:
         message = Parser(policy=policy.default).parsestr(raw_text)
 
-    subject = str(message.get("subject", "") or "")
+    subject = repair_text_encoding(str(message.get("subject", "") or ""))
     sender_name, sender_email = parseaddr(str(message.get("from", "") or ""))
+    sender_name = repair_text_encoding(sender_name)
     raw_date = str(message.get("date", "") or "")
     mail_date = ""
     if raw_date:
@@ -668,11 +806,11 @@ def parse_raw_email(raw_text: str, uploaded_file=None) -> dict[str, str]:
             content_type = part.get_content_type()
             disposition = str(part.get("content-disposition", "")).lower()
             if content_type == "text/plain" and "attachment" not in disposition:
-                body = part.get_content()
+                body = repair_text_encoding(part.get_content())
                 break
     else:
         try:
-            body = message.get_content()
+            body = repair_text_encoding(message.get_content())
         except Exception:
             body = raw_text
 
@@ -684,7 +822,7 @@ def parse_raw_email(raw_text: str, uploaded_file=None) -> dict[str, str]:
         "sender_name": sender_name,
         "sender_email": sender_email,
         "date": mail_date,
-        "body": str(body or raw_text),
+        "body": repair_text_encoding(str(body or raw_text)),
     }
 
 
@@ -1042,7 +1180,14 @@ def import_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFr
                         st.session_state["mail_contact_suggestions"] = pd.DataFrame(columns=CONTACT_COLUMNS)
                     else:
                         st.session_state["mail_task_suggestions"] = extract_task_suggestions("E-Mail", final_subject, mail_body, owner, funding)
-                        st.session_state["mail_contact_suggestions"] = extract_contact_suggestions("E-Mail", final_subject, mail_body, final_sender_name, final_sender_email)
+                        st.session_state["mail_contact_suggestions"] = extract_contact_suggestions(
+                            "E-Mail",
+                            final_subject,
+                            mail_body,
+                            final_sender_name,
+                            final_sender_email,
+                            existing_contacts=contacts,
+                        )
                     st.session_state["mail_detected"] = {
                         "Betreff": final_subject,
                         "Absender": final_sender_name,
@@ -1110,7 +1255,7 @@ def import_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFr
                     continue
                 fingerprints.append((fingerprint, source_title))
                 tasks_for_source = extract_task_suggestions("Protokoll", source_title, source_text, protocol_owner, funding)
-                contacts_for_source = extract_contact_suggestions("Protokoll", source_title, source_text, participants=participants)
+                contacts_for_source = extract_contact_suggestions("Protokoll", source_title, source_text, participants=participants, existing_contacts=contacts)
                 all_tasks.append(tasks_for_source)
                 all_contacts.append(contacts_for_source)
                 summaries.append(protocol_summary(source_title, protocol_date.isoformat(), participants, source_text, tasks_for_source))
@@ -1227,7 +1372,7 @@ def sync_files_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.Da
             update_synced_file_status(selected_fingerprint, "ausgewertet", "Bereits früher übernommen")
         else:
             sync_tasks = extract_task_suggestions("Sync-Protokoll", import_title, selected_content, owner, funding)
-            sync_contacts = extract_contact_suggestions("Sync-Protokoll", import_title, selected_content, participants=participants)
+            sync_contacts = extract_contact_suggestions("Sync-Protokoll", import_title, selected_content, participants=participants, existing_contacts=contacts)
             st.session_state["sync_task_suggestions"] = sync_tasks
             st.session_state["sync_contact_suggestions"] = sync_contacts
             st.session_state["sync_summary"] = protocol_summary(import_title, date.today().isoformat(), participants, selected_content, sync_tasks)
