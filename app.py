@@ -146,17 +146,37 @@ def database_engine():
     return create_engine(url, pool_pre_ping=True)
 
 
-def load_table(path: Path, columns: list[str]) -> pd.DataFrame:
-    ensure_database()
-    table_name, table_columns = table_spec(path, columns)
-    engine = database_engine()
+if st is not None:
+    @st.cache_data(ttl=30, show_spinner=False)
+    def cached_read_table(cached_url: str, cached_table_name: str, cached_columns: tuple[str, ...]) -> pd.DataFrame:
+        engine = create_engine(cached_url, pool_pre_ping=True)
+        with engine.connect() as connection:
+            table = pd.read_sql_query(text(f'SELECT * FROM "{cached_table_name}"'), connection, dtype=str).fillna("")
+        for column in cached_columns:
+            if column not in table.columns:
+                table[column] = ""
+        return table[list(cached_columns)]
+else:
+    cached_read_table = None
+
+
+def read_table_from_database(url: str, table_name: str, columns: tuple[str, ...]) -> pd.DataFrame:
+    if cached_read_table is not None:
+        return cached_read_table(url, table_name, columns)
+
+    engine = create_engine(url, pool_pre_ping=True)
     with engine.connect() as connection:
         table = pd.read_sql_query(text(f'SELECT * FROM "{table_name}"'), connection, dtype=str).fillna("")
-    columns = table_columns
     for column in columns:
         if column not in table.columns:
             table[column] = ""
-    return table[columns]
+    return table[list(columns)]
+
+
+def load_table(path: Path, columns: list[str]) -> pd.DataFrame:
+    ensure_database()
+    table_name, table_columns = table_spec(path, columns)
+    return read_table_from_database(database_url(), table_name, tuple(table_columns))
 
 
 def load_settings() -> dict[str, str]:
@@ -206,6 +226,7 @@ def save_table(path: Path, table: pd.DataFrame, columns: list[str]) -> None:
         output[columns].to_sql(table_name, connection, if_exists="append", index=False)
     output.to_csv(path, index=False)
     if st is not None:
+        st.cache_data.clear()
         st.session_state["database_schema_checked"] = True
 
 
@@ -339,6 +360,48 @@ def mark_tasks_done(all_tasks: pd.DataFrame, task_names: list[str]) -> pd.DataFr
     mask = updated["Aufgabe"].astype(str).str.strip().isin(done_names)
     updated.loc[mask, "Status"] = "erledigt"
     return updated
+
+
+def task_key(row: pd.Series) -> str:
+    return hashlib.sha256(
+        "|".join(
+            [
+                str(row.get("Aufgabe", "")).strip(),
+                str(row.get("Verantwortlich", "")).strip(),
+                str(row.get("Frist", "")).strip(),
+                str(row.get("Bezug zu Förderstelle", "")).strip(),
+            ]
+        ).encode("utf-8")
+    ).hexdigest()[:12]
+
+
+def infer_next_step(task_text: str, notes: str) -> str:
+    combined = f"{task_text} {notes}".lower()
+    if "unterlagen" in combined and any(word in combined for word in ["übermitteln", "senden", "nachreichen"]):
+        return "Unterlagen zusammenstellen, prüfen und an die genannte Stelle übermitteln."
+    if any(word in combined for word in ["kontakt", "telefon", "anrufen", "nachfassen"]):
+        return "Kontakt aufnehmen bzw. nachfassen und das Ergebnis danach kurz im Cockpit dokumentieren."
+    if any(word in combined for word in ["prüfen", "klären", "abklären"]):
+        return "Offene Punkte prüfen, Ergebnis festhalten und daraus den nächsten konkreten Schritt ableiten."
+    if any(word in combined for word in ["termin", "meeting", "besprechung"]):
+        return "Termin koordinieren, Teilnehmer festlegen und Vorbereitungsunterlagen bereitlegen."
+    if any(word in combined for word in ["antrag", "förder", "einreichen"]):
+        return "Förderlogik und Unterlagen prüfen, Zuständigkeit klären und Einreichschritt vorbereiten."
+    return "Aufgabe anhand der Notizen konkretisieren, Zuständigkeit bestätigen und den nächsten Schritt dokumentieren."
+
+
+def show_task_detail(row: pd.Series) -> None:
+    st.markdown(f"**{row.get('Aufgabe', '')}**")
+    detail_cols = st.columns(4)
+    detail_cols[0].write(f"Verantwortlich: {row.get('Verantwortlich', '') or '-'}")
+    detail_cols[1].write(f"Priorität: {row.get('Priorität', '') or '-'}")
+    detail_cols[2].write(f"Status: {row.get('Status', '') or '-'}")
+    detail_cols[3].write(f"Frist: {row.get('Frist', '') or '-'}")
+    if str(row.get("Bezug zu Förderstelle", "")).strip():
+        st.write(f"Bezug: {row.get('Bezug zu Förderstelle', '')}")
+    if str(row.get("Notizen", "")).strip():
+        st.write(f"Notizen: {row.get('Notizen', '')}")
+    st.info(infer_next_step(str(row.get("Aufgabe", "")), str(row.get("Notizen", ""))))
 
 
 def import_fingerprint(source_type: str, title: str, body: str, sender_or_participants: str = "") -> str:
@@ -1478,14 +1541,23 @@ def main() -> None:
     if not check_login(settings):
         return
 
-    funding = load_table(FUNDING_FILE, FUNDING_COLUMNS)
-    tasks = load_table(TASKS_FILE, TASK_COLUMNS)
-    contacts = load_table(CONTACTS_FILE, CONTACT_COLUMNS)
-
     show_header(settings)
 
     with st.sidebar:
         sidebar_admin(settings)
+        page = st.radio(
+            "Bereich",
+            ["Überblick", "Förderstellen", "Aufgaben", "Kontakte", "Import", "Synchronisierte Dateien", "Dokumente", "Bericht"],
+            index=0,
+        )
+
+    funding = load_table(FUNDING_FILE, FUNDING_COLUMNS)
+    tasks = load_table(TASKS_FILE, TASK_COLUMNS)
+    contacts = (
+        load_table(CONTACTS_FILE, CONTACT_COLUMNS)
+        if page in {"Kontakte", "Import", "Synchronisierte Dateien", "Bericht"}
+        else pd.DataFrame(columns=CONTACT_COLUMNS)
+    )
 
     tasks = real_tasks(tasks)
     task_status = normalized_column(tasks, "Status")
@@ -1501,9 +1573,7 @@ def main() -> None:
     metric_cols[2].metric("offene Aufgaben", len(open_tasks))
     metric_cols[3].metric("hohe Priorität", len(high_priority))
 
-    tabs = st.tabs(["Überblick", "Förderstellen", "Aufgaben", "Kontakte", "Import", "Synchronisierte Dateien", "Dokumente", "Bericht"])
-
-    with tabs[0]:
+    if page == "Überblick":
         if not acute_tasks.empty:
             st.subheader("Akut zu erledigen")
             done_now = []
@@ -1512,7 +1582,8 @@ def main() -> None:
                 task_name = str(row.get("Aufgabe", ""))
                 if cols[0].checkbox("Erledigt", key=f"acute_done_{index}", label_visibility="collapsed"):
                     done_now.append(task_name)
-                cols[1].write(task_name)
+                if cols[1].button(task_name, key=f"acute_detail_{task_key(row)}", width="stretch"):
+                    st.session_state["selected_task_detail"] = task_key(row)
                 cols[2].write(str(row.get("Verantwortlich", "")))
                 cols[3].write(str(row.get("Frist", "")))
                 cols[4].write(str(row.get("Bezug zu Förderstelle", "")))
@@ -1520,6 +1591,11 @@ def main() -> None:
                 save_table(TASKS_FILE, mark_tasks_done(tasks, done_now), TASK_COLUMNS)
                 st.success("Markierte Aufgaben wurden erledigt gesetzt.")
                 st.rerun()
+            selected_detail = st.session_state.get("selected_task_detail", "")
+            detail_rows = acute_tasks[acute_tasks.apply(task_key, axis=1) == selected_detail] if selected_detail else pd.DataFrame()
+            if not detail_rows.empty:
+                with st.expander("Aufgabendetails", expanded=True):
+                    show_task_detail(detail_rows.iloc[0])
 
         left, right = st.columns([1.1, 1])
         with left:
@@ -1538,13 +1614,21 @@ def main() -> None:
             if urgent.empty:
                 st.info("Noch keine Aufgaben erfasst.")
             else:
+                selected_task = st.selectbox(
+                    "Aufgabe für Details auswählen",
+                    urgent["Aufgabe"].tolist(),
+                    index=0,
+                    key="overview_task_detail_select",
+                )
+                detail_row = urgent[urgent["Aufgabe"] == selected_task].iloc[0]
+                show_task_detail(detail_row)
                 st.dataframe(
                     urgent[["Einordnung", "Aufgabe", "Verantwortlich", "Priorität", "Status", "Frist", "Bezug zu Förderstelle"]],
                     width="stretch",
                     hide_index=True,
                 )
 
-    with tabs[1]:
+    elif page == "Förderstellen":
         edited = data_editor(
             "Förderstellen verwalten",
             funding,
@@ -1557,7 +1641,7 @@ def main() -> None:
             st.success("Förderstellen gespeichert.")
             st.rerun()
 
-    with tabs[2]:
+    elif page == "Aufgaben":
         st.subheader("Aufgaben und nächste Schritte verwalten")
         show_completed_tasks = st.checkbox("Erledigte Aufgaben anzeigen", value=False)
         if show_completed_tasks:
@@ -1566,6 +1650,9 @@ def main() -> None:
         else:
             visible_tasks = open_task_rows(tasks)
             st.caption("Erledigte Aufgaben werden ausgeblendet. Zum Nachsehen den Schalter Erledigte Aufgaben anzeigen aktivieren.")
+        if not visible_tasks.empty:
+            selected_task = st.selectbox("Aufgabe für Details auswählen", visible_tasks["Aufgabe"].tolist(), key="task_page_detail_select")
+            show_task_detail(visible_tasks[visible_tasks["Aufgabe"] == selected_task].iloc[0])
         edited = task_data_editor(visible_tasks)
         if st.button("Aufgaben speichern", type="primary"):
             final_tasks = edited if show_completed_tasks else pd.concat([completed_task_rows(tasks), edited], ignore_index=True)
@@ -1573,7 +1660,7 @@ def main() -> None:
             st.success("Aufgaben gespeichert.")
             st.rerun()
 
-    with tabs[3]:
+    elif page == "Kontakte":
         edited = data_editor(
             "Ansprechpartner verwalten",
             contacts,
@@ -1586,13 +1673,13 @@ def main() -> None:
             st.success("Kontakte gespeichert.")
             st.rerun()
 
-    with tabs[4]:
+    elif page == "Import":
         import_panel(funding, tasks, contacts)
 
-    with tabs[5]:
+    elif page == "Synchronisierte Dateien":
         sync_files_panel(funding, tasks, contacts)
 
-    with tabs[6]:
+    elif page == "Dokumente":
         st.subheader("Dokumentenordner")
         st.caption("Hier kann die App direkt auf einen lokalen Ordner zugreifen, solange sie auf diesem Mac läuft.")
 
@@ -1647,7 +1734,7 @@ def main() -> None:
                     mime="application/octet-stream",
                 )
 
-    with tabs[7]:
+    elif page == "Bericht":
         st.subheader("Kompakter Projektbericht")
         if not st.session_state.get("report_loaded"):
             if st.button("Projektbericht erstellen", type="primary"):
