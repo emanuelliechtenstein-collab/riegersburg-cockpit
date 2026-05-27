@@ -136,7 +136,14 @@ def is_cloud_database() -> bool:
 
 
 def database_engine():
-    return create_engine(database_url(), pool_pre_ping=True)
+    url = database_url()
+    if st is not None:
+        @st.cache_resource(show_spinner=False)
+        def cached_engine(cached_url: str):
+            return create_engine(cached_url, pool_pre_ping=True)
+
+        return cached_engine(url)
+    return create_engine(url, pool_pre_ping=True)
 
 
 def load_table(path: Path, columns: list[str]) -> pd.DataFrame:
@@ -198,6 +205,8 @@ def save_table(path: Path, table: pd.DataFrame, columns: list[str]) -> None:
         connection.execute(text(f'DELETE FROM "{table_name}"'))
         output[columns].to_sql(table_name, connection, if_exists="append", index=False)
     output.to_csv(path, index=False)
+    if st is not None:
+        st.session_state["database_schema_checked"] = True
 
 
 def ensure_table_schema(connection, table_name: str, columns: list[str]) -> None:
@@ -213,6 +222,9 @@ def ensure_table_schema(connection, table_name: str, columns: list[str]) -> None
 
 
 def ensure_database() -> None:
+    if st is not None and st.session_state.get("database_schema_checked"):
+        return
+
     BACKUP_DIR.mkdir(exist_ok=True)
     settings = load_settings()
     engine = database_engine()
@@ -238,6 +250,9 @@ def ensure_database() -> None:
                 table[columns].to_sql(table_name, connection, if_exists="append", index=False)
             settings[migration_key] = datetime.now().isoformat(timespec="seconds")
             save_settings(settings)
+
+    if st is not None:
+        st.session_state["database_schema_checked"] = True
 
 
 def backup_database() -> Path:
@@ -314,6 +329,16 @@ def acute_task_rows(tasks: pd.DataFrame) -> pd.DataFrame:
     if urgent.empty:
         return urgent
     return urgent[urgent["Dringlichkeit"] >= 45].head(6)
+
+
+def mark_tasks_done(all_tasks: pd.DataFrame, task_names: list[str]) -> pd.DataFrame:
+    updated = all_tasks.copy()
+    done_names = {str(name).strip() for name in task_names if str(name).strip()}
+    if not done_names or "Aufgabe" not in updated.columns:
+        return updated
+    mask = updated["Aufgabe"].astype(str).str.strip().isin(done_names)
+    updated.loc[mask, "Status"] = "erledigt"
+    return updated
 
 
 def import_fingerprint(source_type: str, title: str, body: str, sender_or_participants: str = "") -> str:
@@ -1321,6 +1346,9 @@ def import_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFr
                 st.rerun()
 
     with st.expander("Import-Historie"):
+        if not st.checkbox("Import-Historie laden", value=False):
+            st.info("Die Historie wird erst geladen, wenn der Haken gesetzt ist.")
+            return
         imports = load_imports()
         if imports.empty:
             st.info("Noch keine Importe gespeichert.")
@@ -1331,6 +1359,13 @@ def import_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFr
 def sync_files_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFrame) -> None:
     st.subheader("Synchronisierte Dateien vom Mac")
     st.caption("Hier erscheinen Protokolle, die der lokale Sync-Helfer aus deinem Desktop-Ordner in die Cloud übertragen hat.")
+
+    if not st.session_state.get("sync_files_loaded"):
+        if st.button("Synchronisierte Dateien laden", type="primary"):
+            st.session_state["sync_files_loaded"] = True
+            st.rerun()
+        st.info("Die synchronisierten Dateien werden erst geladen, wenn du sie brauchst. Das beschleunigt den App-Start.")
+        return
 
     synced_files = load_synced_files()
     if synced_files.empty:
@@ -1460,14 +1495,6 @@ def main() -> None:
     active_funding = funding[~funding["Status"].str.lower().isin(["bewilligt", "abgelehnt"])] if not funding.empty else funding
     acute_tasks = acute_task_rows(tasks)
 
-    if not acute_tasks.empty:
-        st.warning(f"{len(acute_tasks)} akut zu erledigende Aufgabe(n) benötigen Aufmerksamkeit.")
-        st.dataframe(
-            acute_tasks[["Einordnung", "Aufgabe", "Verantwortlich", "Priorität", "Frist", "Bezug zu Förderstelle"]],
-            width="stretch",
-            hide_index=True,
-        )
-
     metric_cols = st.columns(4)
     metric_cols[0].metric("Förderlinien", len(funding))
     metric_cols[1].metric("aktive Linien", len(active_funding))
@@ -1477,6 +1504,23 @@ def main() -> None:
     tabs = st.tabs(["Überblick", "Förderstellen", "Aufgaben", "Kontakte", "Import", "Synchronisierte Dateien", "Dokumente", "Bericht"])
 
     with tabs[0]:
+        if not acute_tasks.empty:
+            st.subheader("Akut zu erledigen")
+            done_now = []
+            for index, row in acute_tasks.iterrows():
+                cols = st.columns([0.15, 1.5, 0.45, 0.35, 0.55])
+                task_name = str(row.get("Aufgabe", ""))
+                if cols[0].checkbox("Erledigt", key=f"acute_done_{index}", label_visibility="collapsed"):
+                    done_now.append(task_name)
+                cols[1].write(task_name)
+                cols[2].write(str(row.get("Verantwortlich", "")))
+                cols[3].write(str(row.get("Frist", "")))
+                cols[4].write(str(row.get("Bezug zu Förderstelle", "")))
+            if done_now and st.button("Markierte akute Aufgaben als erledigt speichern", type="primary"):
+                save_table(TASKS_FILE, mark_tasks_done(tasks, done_now), TASK_COLUMNS)
+                st.success("Markierte Aufgaben wurden erledigt gesetzt.")
+                st.rerun()
+
         left, right = st.columns([1.1, 1])
         with left:
             st.subheader("Status je Förderlinie")
@@ -1564,6 +1608,13 @@ def main() -> None:
                 save_settings(settings)
                 st.success("Ordnerpfad gespeichert.")
 
+        if not st.session_state.get("documents_loaded"):
+            if st.button("Dokumentenordner scannen", type="primary"):
+                st.session_state["documents_loaded"] = True
+                st.rerun()
+            st.info("Der lokale Dokumentenordner wird erst gescannt, wenn du ihn brauchst.")
+            return
+
         folder = Path(document_dir).expanduser()
         documents = scan_documents(folder)
 
@@ -1598,6 +1649,12 @@ def main() -> None:
 
     with tabs[7]:
         st.subheader("Kompakter Projektbericht")
+        if not st.session_state.get("report_loaded"):
+            if st.button("Projektbericht erstellen", type="primary"):
+                st.session_state["report_loaded"] = True
+                st.rerun()
+            st.info("Der Bericht wird erst erstellt, wenn du ihn brauchst.")
+            return
         report = markdown_report(funding, tasks, contacts)
         st.text_area("Vorschau", report, height=480)
         st.download_button(
