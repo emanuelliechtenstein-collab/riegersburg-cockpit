@@ -297,6 +297,25 @@ def task_data_editor(tasks: pd.DataFrame) -> pd.DataFrame:
     return edited[TASK_COLUMNS]
 
 
+def open_task_rows(tasks: pd.DataFrame) -> pd.DataFrame:
+    if tasks.empty:
+        return tasks
+    return tasks[normalized_column(tasks, "Status") != "erledigt"].copy()
+
+
+def completed_task_rows(tasks: pd.DataFrame) -> pd.DataFrame:
+    if tasks.empty:
+        return tasks
+    return tasks[normalized_column(tasks, "Status") == "erledigt"].copy()
+
+
+def acute_task_rows(tasks: pd.DataFrame) -> pd.DataFrame:
+    urgent = add_urgency(open_task_rows(tasks))
+    if urgent.empty:
+        return urgent
+    return urgent[urgent["Dringlichkeit"] >= 45].head(6)
+
+
 def import_fingerprint(source_type: str, title: str, body: str, sender_or_participants: str = "") -> str:
     normalized = "\n".join(
         [
@@ -1436,9 +1455,18 @@ def main() -> None:
     tasks = real_tasks(tasks)
     task_status = normalized_column(tasks, "Status")
     task_priority = normalized_column(tasks, "Priorität")
-    open_tasks = tasks[task_status != "erledigt"] if not tasks.empty else tasks
+    open_tasks = open_task_rows(tasks)
     high_priority = tasks[(task_priority == "hoch") & (task_status != "erledigt")] if not tasks.empty else tasks
     active_funding = funding[~funding["Status"].str.lower().isin(["bewilligt", "abgelehnt"])] if not funding.empty else funding
+    acute_tasks = acute_task_rows(tasks)
+
+    if not acute_tasks.empty:
+        st.warning(f"{len(acute_tasks)} akut zu erledigende Aufgabe(n) benötigen Aufmerksamkeit.")
+        st.dataframe(
+            acute_tasks[["Einordnung", "Aufgabe", "Verantwortlich", "Priorität", "Frist", "Bezug zu Förderstelle"]],
+            width="stretch",
+            hide_index=True,
+        )
 
     metric_cols = st.columns(4)
     metric_cols[0].metric("Förderlinien", len(funding))
@@ -1462,7 +1490,7 @@ def main() -> None:
                 )
         with right:
             st.subheader("Priorisierte nächste Schritte")
-            urgent = add_urgency(tasks)
+            urgent = add_urgency(open_tasks)
             if urgent.empty:
                 st.info("Noch keine Aufgaben erfasst.")
             else:
@@ -1487,10 +1515,17 @@ def main() -> None:
 
     with tabs[2]:
         st.subheader("Aufgaben und nächste Schritte verwalten")
-        st.caption("Zum Löschen eine Zeile in der Spalte Löschen anhaken und anschließend Aufgaben speichern.")
-        edited = task_data_editor(tasks)
+        show_completed_tasks = st.checkbox("Erledigte Aufgaben anzeigen", value=False)
+        if show_completed_tasks:
+            visible_tasks = tasks
+            st.caption("Erledigte Aufgaben sind sichtbar. Zum Löschen eine Zeile in der Spalte Löschen anhaken und anschließend Aufgaben speichern.")
+        else:
+            visible_tasks = open_task_rows(tasks)
+            st.caption("Erledigte Aufgaben werden ausgeblendet. Zum Nachsehen den Schalter Erledigte Aufgaben anzeigen aktivieren.")
+        edited = task_data_editor(visible_tasks)
         if st.button("Aufgaben speichern", type="primary"):
-            save_table(TASKS_FILE, edited, TASK_COLUMNS)
+            final_tasks = edited if show_completed_tasks else pd.concat([completed_task_rows(tasks), edited], ignore_index=True)
+            save_table(TASKS_FILE, final_tasks, TASK_COLUMNS)
             st.success("Aufgaben gespeichert.")
             st.rerun()
 
