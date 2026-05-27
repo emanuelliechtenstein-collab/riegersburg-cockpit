@@ -1476,6 +1476,8 @@ def sync_files_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.Da
     )
     selected_row = visible[visible["fingerprint"] == selected_fingerprint].iloc[0]
     selected_content = load_synced_file_content(selected_fingerprint)
+    import_title = str(selected_row.get("filename", "Synchronisierte Datei"))
+    source_path = str(selected_row.get("source_path", ""))
 
     if selected_content:
         with st.expander("Textvorschau"):
@@ -1488,8 +1490,6 @@ def sync_files_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.Da
         )
     else:
         st.warning("Diese Datei enthält keinen lesbaren Text. Bitte als TXT, Markdown, SRT oder VTT im Mac-Ordner speichern.")
-    import_title = str(selected_row.get("filename", "Synchronisierte Datei"))
-    source_path = str(selected_row.get("source_path", ""))
 
     if st.button("Ausgewählte Datei auswerten", type="primary"):
         fingerprint = import_fingerprint("Sync-Protokoll", import_title, selected_content, source_path + participants)
