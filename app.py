@@ -1578,24 +1578,27 @@ def main() -> None:
             st.subheader("Akut zu erledigen")
             done_now = []
             for index, row in acute_tasks.iterrows():
-                cols = st.columns([0.15, 1.5, 0.45, 0.35, 0.55])
+                cols = st.columns([0.15, 2.85])
                 task_name = str(row.get("Aufgabe", ""))
                 if cols[0].checkbox("Erledigt", key=f"acute_done_{index}", label_visibility="collapsed"):
                     done_now.append(task_name)
-                if cols[1].button(task_name, key=f"acute_detail_{task_key(row)}", width="stretch"):
-                    st.session_state["selected_task_detail"] = task_key(row)
-                cols[2].write(str(row.get("Verantwortlich", "")))
-                cols[3].write(str(row.get("Frist", "")))
-                cols[4].write(str(row.get("Bezug zu Förderstelle", "")))
+                summary_bits = [
+                    str(row.get("Verantwortlich", "")).strip(),
+                    str(row.get("Frist", "")).strip(),
+                    str(row.get("Bezug zu Förderstelle", "")).strip(),
+                ]
+                summary = " | ".join(bit for bit in summary_bits if bit)
+                expander_title = f"{task_name}    {summary}" if summary else task_name
+                with cols[1].expander(expander_title):
+                    show_task_detail(row)
+                    if st.button("Diese Aufgabe als erledigt markieren", key=f"acute_done_button_{task_key(row)}"):
+                        save_table(TASKS_FILE, mark_tasks_done(tasks, [task_name]), TASK_COLUMNS)
+                        st.success("Aufgabe wurde erledigt gesetzt.")
+                        st.rerun()
             if done_now and st.button("Markierte akute Aufgaben als erledigt speichern", type="primary"):
                 save_table(TASKS_FILE, mark_tasks_done(tasks, done_now), TASK_COLUMNS)
                 st.success("Markierte Aufgaben wurden erledigt gesetzt.")
                 st.rerun()
-            selected_detail = st.session_state.get("selected_task_detail", "")
-            detail_rows = acute_tasks[acute_tasks.apply(task_key, axis=1) == selected_detail] if selected_detail else pd.DataFrame()
-            if not detail_rows.empty:
-                with st.expander("Aufgabendetails", expanded=True):
-                    show_task_detail(detail_rows.iloc[0])
 
         left, right = st.columns([1.1, 1])
         with left:
