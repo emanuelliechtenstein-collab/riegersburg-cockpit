@@ -1545,17 +1545,19 @@ def main() -> None:
 
     with st.sidebar:
         sidebar_admin(settings)
-        page = st.radio(
-            "Bereich",
-            ["Überblick", "Förderstellen", "Aufgaben", "Kontakte", "Import", "Synchronisierte Dateien", "Dokumente", "Bericht"],
-            index=0,
-        )
+
+    page = st.radio(
+        "Bereich",
+        ["Überblick", "Förderstellen", "Aufgaben", "Kontakte", "Import / Uploads", "Synchronisierte Dateien", "Dokumente", "Bericht"],
+        index=0,
+        horizontal=True,
+    )
 
     funding = load_table(FUNDING_FILE, FUNDING_COLUMNS)
     tasks = load_table(TASKS_FILE, TASK_COLUMNS)
     contacts = (
         load_table(CONTACTS_FILE, CONTACT_COLUMNS)
-        if page in {"Kontakte", "Import", "Synchronisierte Dateien", "Bericht"}
+        if page in {"Kontakte", "Import / Uploads", "Synchronisierte Dateien", "Bericht"}
         else pd.DataFrame(columns=CONTACT_COLUMNS)
     )
 
@@ -1600,36 +1602,8 @@ def main() -> None:
                 st.success("Markierte Aufgaben wurden erledigt gesetzt.")
                 st.rerun()
 
-        left, right = st.columns([1.1, 1])
-        with left:
-            st.subheader("Status je Förderlinie")
-            if funding.empty:
-                st.info("Noch keine Förderstellen erfasst.")
-            else:
-                st.dataframe(
-                    funding[["Name", "Ebene", "Status", "geschätztes Förderpotenzial", "nächste Aktion", "Frist"]],
-                    width="stretch",
-                    hide_index=True,
-                )
-        with right:
-            st.subheader("Priorisierte nächste Schritte")
-            urgent = add_urgency(open_tasks)
-            if urgent.empty:
-                st.info("Noch keine Aufgaben erfasst.")
-            else:
-                selected_task = st.selectbox(
-                    "Aufgabe für Details auswählen",
-                    urgent["Aufgabe"].tolist(),
-                    index=0,
-                    key="overview_task_detail_select",
-                )
-                detail_row = urgent[urgent["Aufgabe"] == selected_task].iloc[0]
-                show_task_detail(detail_row)
-                st.dataframe(
-                    urgent[["Einordnung", "Aufgabe", "Verantwortlich", "Priorität", "Status", "Frist", "Bezug zu Förderstelle"]],
-                    width="stretch",
-                    hide_index=True,
-                )
+        if acute_tasks.empty:
+            st.info("Keine akuten Aufgaben. Weitere offene Aufgaben finden Sie im Bereich Aufgaben.")
 
     elif page == "Förderstellen":
         edited = data_editor(
@@ -1676,7 +1650,7 @@ def main() -> None:
             st.success("Kontakte gespeichert.")
             st.rerun()
 
-    elif page == "Import":
+    elif page == "Import / Uploads":
         import_panel(funding, tasks, contacts)
 
     elif page == "Synchronisierte Dateien":
