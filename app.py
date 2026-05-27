@@ -961,65 +961,58 @@ def protocol_summary(title: str, protocol_date: str, participants: str, body: st
 
 def markdown_report(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFrame) -> str:
     tasks = real_tasks(tasks)
-    urgent_tasks = add_urgency(tasks).head(8)
+    urgent_tasks = add_urgency(open_task_rows(tasks)).head(5)
     open_tasks = tasks[normalized_column(tasks, "Status") != "erledigt"] if not tasks.empty else tasks
     active_funding = funding[~funding["Status"].str.lower().isin(["bewilligt", "abgelehnt"])] if not funding.empty else funding
+    critical_tasks = urgent_tasks[urgent_tasks["Einordnung"].isin(["kritisch", "hoch"])] if not urgent_tasks.empty else urgent_tasks
+    next_funding = active_funding[active_funding["nächste Aktion"].astype(str).str.strip() != ""] if not active_funding.empty else active_funding
+    top_contacts = contacts[contacts["Relevanz"].astype(str).str.lower() == "hoch"].head(4) if not contacts.empty else contacts
 
     lines = [
-        "# Riegersburg Sanierungsprogramm - Projektbericht",
+        "# Riegersburg Sanierungsprogramm - Kurzbericht",
         "",
         f"Erstellt am: {date.today().strftime('%d.%m.%Y')}",
         "",
-        "## Kurzstatus",
+        "## Lage",
         "",
-        f"- Förderlinien gesamt: {len(funding)}",
-        f"- aktive Förderlinien: {len(active_funding)}",
-        f"- Aufgaben gesamt: {len(tasks)}",
-        f"- offene Aufgaben: {len(open_tasks)}",
-        f"- Kontakte gesamt: {len(contacts)}",
+        (
+            f"Derzeit sind {len(active_funding)} von {len(funding)} Förderlinien aktiv. "
+            f"Im Cockpit stehen {len(open_tasks)} offene Aufgaben, davon {len(critical_tasks)} mit hoher oder kritischer Dringlichkeit. "
+            f"Die Kontaktbasis umfasst {len(contacts)} erfasste Ansprechpartner."
+        ),
         "",
-        "## Status je Förderlinie",
+        "## Was jetzt wichtig ist",
         "",
     ]
 
-    if funding.empty:
-        lines.append("Noch keine Förderstellen erfasst.")
-    else:
-        for _, row in funding.iterrows():
-            lines.extend(
-                [
-                    f"### {row['Name']}",
-                    f"- Ebene: {row['Ebene']}",
-                    f"- Zuständige Stelle: {row['zuständige Stelle']}",
-                    f"- Ansprechpartner: {row['Ansprechpartner']}",
-                    f"- Förderpotenzial: {row['geschätztes Förderpotenzial']}",
-                    f"- Status: {row['Status']}",
-                    f"- Nächste Aktion: {row['nächste Aktion']}",
-                    f"- Frist: {row['Frist']}",
-                    f"- Notizen: {row['Notizen']}",
-                    "",
-                ]
-            )
-
-    lines.extend(["## Dringende Aufgaben", ""])
     if urgent_tasks.empty:
-        lines.append("Keine Aufgaben erfasst.")
+        lines.append("Aktuell sind keine dringenden Aufgaben erfasst.")
     else:
         for _, row in urgent_tasks.iterrows():
+            sentence = f"{row['Aufgabe']} liegt bei {row['Verantwortlich'] or 'noch nicht zugeordnet'}"
+            if str(row.get("Frist", "")).strip():
+                sentence += f" und sollte bis {row['Frist']} erledigt werden"
+            if str(row.get("Bezug zu Förderstelle", "")).strip():
+                sentence += f". Der Bezug liegt bei {row['Bezug zu Förderstelle']}"
+            lines.append(f"- {sentence}.")
+
+    lines.extend(["", "## Förderstand", ""])
+    if next_funding.empty:
+        lines.append("Bei den aktiven Förderlinien ist derzeit keine konkrete nächste Aktion hinterlegt.")
+    else:
+        for _, row in next_funding.head(5).iterrows():
             lines.append(
-                f"- **{row['Einordnung']}**: {row['Aufgabe']} | verantwortlich: {row['Verantwortlich']} | "
-                f"Frist: {row['Frist']} | Bezug: {row['Bezug zu Förderstelle']}"
+                f"- Für {row['Name']} ist der Status {row['Status']}. Als nächster Schritt ist vorgesehen: {row['nächste Aktion']}."
             )
 
-    lines.extend(["", "## Wichtige Kontakte", ""])
-    relevant_contacts = contacts[contacts["Relevanz"].str.lower() == "hoch"] if not contacts.empty else contacts
-    if relevant_contacts.empty:
-        lines.append("Keine hoch relevanten Kontakte erfasst.")
+    lines.extend(["", "## Kontakte", ""])
+    if top_contacts.empty:
+        lines.append("Es sind derzeit keine besonders hoch priorisierten Kontakte markiert.")
     else:
-        for _, row in relevant_contacts.iterrows():
-            lines.append(
-                f"- {row['Name']} ({row['Organisation']}) | {row['Funktion']} | nächste Aktion: {row['nächste Aktion']}"
-            )
+        for _, row in top_contacts.iterrows():
+            action = str(row.get("nächste Aktion", "")).strip()
+            addition = f" Die nächste Aktion lautet: {action}." if action else ""
+            lines.append(f"- {row['Name']} bleibt ein wichtiger Kontakt.{addition}")
 
     return "\n".join(lines)
 
@@ -1423,13 +1416,6 @@ def sync_files_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.Da
     st.subheader("Synchronisierte Dateien vom Mac")
     st.caption("Hier erscheinen Protokolle, die der lokale Sync-Helfer aus deinem Desktop-Ordner in die Cloud übertragen hat.")
 
-    if not st.session_state.get("sync_files_loaded"):
-        if st.button("Synchronisierte Dateien laden", type="primary"):
-            st.session_state["sync_files_loaded"] = True
-            st.rerun()
-        st.info("Die synchronisierten Dateien werden erst geladen, wenn du sie brauchst. Das beschleunigt den App-Start.")
-        return
-
     synced_files = load_synced_files()
     if synced_files.empty:
         st.info("Noch keine synchronisierten Dateien gefunden. Starte zuerst den lokalen Sync-Helfer auf deinem Mac.")
@@ -1446,6 +1432,43 @@ def sync_files_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.Da
         visible = visible[mask]
 
     st.caption(f"{len(visible)} offene Datei(en) sichtbar. Bereits übernommene Dateien bleiben über den Schalter erreichbar.")
+    owner = st.text_input("Standard-Verantwortlich", value="Projektteam", key="sync_owner")
+    participants = st.text_area("Teilnehmer / Kontext", height=80, key="sync_participants")
+
+    open_for_batch = visible[visible["status"].str.lower() != "ausgewertet"] if not visible.empty else visible
+    if not open_for_batch.empty and st.button("Alle offenen Dateien auswerten", type="primary"):
+        all_tasks = []
+        all_contacts = []
+        summaries = []
+        fingerprints = []
+        file_fingerprints = []
+        duplicate_titles = []
+        for _, source_row in open_for_batch.iterrows():
+            source_title = str(source_row.get("filename", "Synchronisierte Datei"))
+            source_path = str(source_row.get("source_path", ""))
+            source_file_fingerprint = str(source_row.get("fingerprint", ""))
+            source_content = load_synced_file_content(source_file_fingerprint)
+            if not source_content.strip():
+                continue
+            fingerprint = import_fingerprint("Sync-Protokoll", source_title, source_content, source_path + participants)
+            if import_exists(fingerprint):
+                duplicate_titles.append(source_title)
+                update_synced_file_status(source_file_fingerprint, "ausgewertet", "Bereits früher übernommen")
+                continue
+            tasks_for_source = extract_task_suggestions("Sync-Protokoll", source_title, source_content, owner, funding)
+            contacts_for_source = extract_contact_suggestions("Sync-Protokoll", source_title, source_content, participants=participants, existing_contacts=contacts)
+            all_tasks.append(tasks_for_source)
+            all_contacts.append(contacts_for_source)
+            summaries.append(protocol_summary(source_title, date.today().isoformat(), participants, source_content, tasks_for_source))
+            fingerprints.append((fingerprint, source_title))
+            file_fingerprints.append(source_file_fingerprint)
+
+        st.session_state["sync_fingerprints"] = fingerprints
+        st.session_state["sync_file_fingerprints"] = file_fingerprints
+        st.session_state["sync_duplicates"] = duplicate_titles
+        st.session_state["sync_task_suggestions"] = pd.concat(all_tasks, ignore_index=True).drop_duplicates(subset=["Aufgabe"], keep="last") if all_tasks else pd.DataFrame(columns=TASK_COLUMNS)
+        st.session_state["sync_contact_suggestions"] = pd.concat(all_contacts, ignore_index=True).drop_duplicates(subset=["Name"], keep="last") if all_contacts else pd.DataFrame(columns=CONTACT_COLUMNS)
+        st.session_state["sync_summary"] = "\n\n---\n\n".join(summaries)
 
     st.dataframe(
         visible[["filename", "synced_at", "file_type", "status", "notes"]],
@@ -1470,9 +1493,6 @@ def sync_files_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.Da
             st.text_area("Inhalt", selected_content[:12000], height=260, disabled=True)
     else:
         st.warning("Diese Datei enthält keinen lesbaren Text. Bitte als TXT, Markdown, SRT oder VTT im Mac-Ordner speichern.")
-
-    owner = st.text_input("Standard-Verantwortlich für diese Datei", value="Projektteam", key="sync_owner")
-    participants = st.text_area("Teilnehmer / Kontext für diese Datei", height=80, key="sync_participants")
     import_title = str(selected_row.get("filename", "Synchronisierte Datei"))
     source_path = str(selected_row.get("source_path", ""))
 
@@ -1482,6 +1502,8 @@ def sync_files_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.Da
         st.session_state["sync_duplicate"] = import_exists(fingerprint)
         st.session_state["sync_selected_title"] = import_title
         st.session_state["sync_selected_file_fingerprint"] = selected_fingerprint
+        st.session_state["sync_fingerprints"] = [(fingerprint, import_title)]
+        st.session_state["sync_file_fingerprints"] = [selected_fingerprint]
         if st.session_state["sync_duplicate"]:
             st.session_state["sync_task_suggestions"] = pd.DataFrame(columns=TASK_COLUMNS)
             st.session_state["sync_contact_suggestions"] = pd.DataFrame(columns=CONTACT_COLUMNS)
@@ -1496,6 +1518,8 @@ def sync_files_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.Da
 
     if st.session_state.get("sync_duplicate"):
         st.warning("Diese Datei wurde bereits ausgewertet. Es wurden keine neuen Vorschläge erzeugt.")
+    if st.session_state.get("sync_duplicates"):
+        st.warning("Bereits importiert: " + ", ".join(st.session_state["sync_duplicates"]))
 
     summary = st.session_state.get("sync_summary", "")
     if summary:
@@ -1514,8 +1538,10 @@ def sync_files_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.Da
         edited_sync_tasks = data_editor("Aufgabenvorschläge aus synchronisierter Datei", sync_tasks, TASK_COLUMNS, "sync_tasks_editor", {"Priorität": PRIORITIES, "Status": TASK_STATUS})
         if st.button("Aufgaben aus synchronisierter Datei speichern"):
             save_table(TASKS_FILE, append_unique(tasks, edited_sync_tasks, "Aufgabe"), TASK_COLUMNS)
-            record_import(st.session_state.get("sync_import_fingerprint", ""), "Sync-Protokoll", st.session_state.get("sync_selected_title", ""), "Aufgaben gespeichert")
-            update_synced_file_status(st.session_state.get("sync_selected_file_fingerprint", ""), "ausgewertet", "Aufgaben gespeichert")
+            for fingerprint, source_title in st.session_state.get("sync_fingerprints", []):
+                record_import(fingerprint, "Sync-Protokoll", source_title, "Aufgaben gespeichert")
+            for file_fingerprint in st.session_state.get("sync_file_fingerprints", []):
+                update_synced_file_status(file_fingerprint, "ausgewertet", "Aufgaben gespeichert")
             st.success("Aufgaben aus synchronisierter Datei gespeichert.")
             st.rerun()
     else:
@@ -1525,8 +1551,10 @@ def sync_files_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.Da
         edited_sync_contacts = data_editor("Kontaktvorschläge aus synchronisierter Datei", sync_contacts, CONTACT_COLUMNS, "sync_contacts_editor", {"Relevanz": RELEVANCE})
         if st.button("Kontakte aus synchronisierter Datei speichern"):
             save_table(CONTACTS_FILE, append_unique(contacts, edited_sync_contacts, "Name"), CONTACT_COLUMNS)
-            record_import(st.session_state.get("sync_import_fingerprint", ""), "Sync-Protokoll", st.session_state.get("sync_selected_title", ""), "Kontakte gespeichert")
-            update_synced_file_status(st.session_state.get("sync_selected_file_fingerprint", ""), "ausgewertet", "Kontakte gespeichert")
+            for fingerprint, source_title in st.session_state.get("sync_fingerprints", []):
+                record_import(fingerprint, "Sync-Protokoll", source_title, "Kontakte gespeichert")
+            for file_fingerprint in st.session_state.get("sync_file_fingerprints", []):
+                update_synced_file_status(file_fingerprint, "ausgewertet", "Kontakte gespeichert")
             st.success("Kontakte aus synchronisierter Datei gespeichert.")
             st.rerun()
 
@@ -1657,59 +1685,97 @@ def main() -> None:
         sync_files_panel(funding, tasks, contacts)
 
     elif page == "Dokumente":
-        st.subheader("Dokumentenordner")
-        st.caption("Hier kann die App direkt auf einen lokalen Ordner zugreifen, solange sie auf diesem Mac läuft.")
+        if is_cloud_database():
+            st.subheader("Dokumentenarchiv")
+            st.caption("In der Online-App werden die per Mac-Sync übertragenen Dokumente angezeigt.")
+            documents = load_synced_files()
+            if documents.empty:
+                st.info("Noch keine synchronisierten Dokumente gefunden.")
+                return
 
-        document_dir = st.text_input(
-            "Ordnerpfad",
-            value=settings.get("document_dir", str(DEFAULT_DOCUMENT_DIR)),
-            help="Zum Beispiel: /Users/rauby/Desktop/Riegersburg_Cockpit",
-        )
-        col_a, col_b = st.columns([1, 2])
-        with col_a:
-            if st.button("Ordnerpfad speichern", type="primary", width="stretch"):
-                settings["document_dir"] = document_dir
-                save_settings(settings)
-                st.success("Ordnerpfad gespeichert.")
-
-        if not st.session_state.get("documents_loaded"):
-            if st.button("Dokumentenordner scannen", type="primary"):
-                st.session_state["documents_loaded"] = True
-                st.rerun()
-            st.info("Der lokale Dokumentenordner wird erst gescannt, wenn du ihn brauchst.")
-            return
-
-        folder = Path(document_dir).expanduser()
-        documents = scan_documents(folder)
-
-        if not folder.exists():
-            st.warning("Der angegebene Ordner wurde nicht gefunden.")
-        elif documents.empty:
-            st.info("In diesem Ordner wurden keine Word-, PDF-, Markdown- oder CSV-Dateien gefunden.")
-        else:
-            st.metric("Gefundene Dokumente", len(documents))
-            search = st.text_input("Dateien filtern", placeholder="z. B. BDA, Wiesenhofer, Förderantrag")
+            search = st.text_input("Dokumente filtern", placeholder="z. B. BDA, Wiesenhofer, Förderantrag")
             visible_documents = documents
             if search:
                 mask = documents.apply(lambda row: search.lower() in " ".join(row.astype(str)).lower(), axis=1)
                 visible_documents = documents[mask]
 
+            st.metric("Synchronisierte Dokumente", len(visible_documents))
             st.dataframe(
-                visible_documents[["Datei", "Typ", "Ordner", "Größe KB"]],
+                visible_documents[["filename", "synced_at", "file_type", "status", "notes"]],
                 width="stretch",
                 hide_index=True,
             )
 
             if not visible_documents.empty:
-                selected_file = st.selectbox("Datei auswählen", visible_documents["Pfad"].tolist(), format_func=lambda value: Path(value).name)
-                selected_path = Path(selected_file)
-                st.code(str(selected_path), language=None)
-                st.download_button(
-                    "Ausgewählte Datei herunterladen",
-                    selected_path.read_bytes(),
-                    file_name=selected_path.name,
-                    mime="application/octet-stream",
+                selected_fingerprint = st.selectbox(
+                    "Dokument auswählen",
+                    visible_documents["fingerprint"].tolist(),
+                    format_func=lambda value: visible_documents.loc[visible_documents["fingerprint"] == value, "filename"].iloc[0],
                 )
+                selected_name = visible_documents.loc[visible_documents["fingerprint"] == selected_fingerprint, "filename"].iloc[0]
+                selected_content = load_synced_file_content(selected_fingerprint)
+                st.download_button(
+                    "Text herunterladen",
+                    selected_content,
+                    file_name=f"{Path(selected_name).stem}.txt",
+                    mime="text/plain",
+                )
+                with st.expander("Textvorschau"):
+                    st.text_area("Inhalt", selected_content[:12000], height=320, disabled=True)
+        else:
+            st.subheader("Dokumentenordner")
+            st.caption("Hier kann die App direkt auf einen lokalen Ordner zugreifen, solange sie auf diesem Mac läuft.")
+
+            document_dir = st.text_input(
+                "Ordnerpfad",
+                value=settings.get("document_dir", str(DEFAULT_DOCUMENT_DIR)),
+                help="Zum Beispiel: /Users/rauby/Desktop/Riegersburg_Cockpit",
+            )
+            col_a, col_b = st.columns([1, 2])
+            with col_a:
+                if st.button("Ordnerpfad speichern", type="primary", width="stretch"):
+                    settings["document_dir"] = document_dir
+                    save_settings(settings)
+                    st.success("Ordnerpfad gespeichert.")
+
+            if not st.session_state.get("documents_loaded"):
+                if st.button("Dokumentenordner scannen", type="primary"):
+                    st.session_state["documents_loaded"] = True
+                    st.rerun()
+                st.info("Der lokale Dokumentenordner wird erst gescannt, wenn du ihn brauchst.")
+                return
+
+            folder = Path(document_dir).expanduser()
+            documents = scan_documents(folder)
+
+            if not folder.exists():
+                st.warning("Der angegebene Ordner wurde nicht gefunden.")
+            elif documents.empty:
+                st.info("In diesem Ordner wurden keine Word-, PDF-, Markdown- oder CSV-Dateien gefunden.")
+            else:
+                st.metric("Gefundene Dokumente", len(documents))
+                search = st.text_input("Dateien filtern", placeholder="z. B. BDA, Wiesenhofer, Förderantrag")
+                visible_documents = documents
+                if search:
+                    mask = documents.apply(lambda row: search.lower() in " ".join(row.astype(str)).lower(), axis=1)
+                    visible_documents = documents[mask]
+
+                st.dataframe(
+                    visible_documents[["Datei", "Typ", "Ordner", "Größe KB"]],
+                    width="stretch",
+                    hide_index=True,
+                )
+
+                if not visible_documents.empty:
+                    selected_file = st.selectbox("Datei auswählen", visible_documents["Pfad"].tolist(), format_func=lambda value: Path(value).name)
+                    selected_path = Path(selected_file)
+                    st.code(str(selected_path), language=None)
+                    st.download_button(
+                        "Ausgewählte Datei herunterladen",
+                        selected_path.read_bytes(),
+                        file_name=selected_path.name,
+                        mime="application/octet-stream",
+                    )
 
     elif page == "Bericht":
         st.subheader("Kompakter Projektbericht")
@@ -1720,22 +1786,27 @@ def main() -> None:
             st.info("Der Bericht wird erst erstellt, wenn du ihn brauchst.")
             return
         report = markdown_report(funding, tasks, contacts)
-        st.text_area("Vorschau", report, height=480)
-        st.download_button(
+        action_cols = st.columns([1, 1, 2])
+        action_cols[0].download_button(
             "Markdown herunterladen",
             report,
             file_name=f"riegersburg-projektbericht-{date.today().isoformat()}.md",
             mime="text/markdown",
+            width="stretch",
         )
         if PDF_AVAILABLE:
-            st.download_button(
+            action_cols[1].download_button(
                 "PDF herunterladen",
                 pdf_report(report),
                 file_name=f"riegersburg-projektbericht-{date.today().isoformat()}.pdf",
                 mime="application/pdf",
+                width="stretch",
             )
         else:
             st.warning("PDF-Export ist erst nach Installation von `reportlab` verfügbar.")
+        st.markdown(report)
+        with st.expander("Markdown-Text anzeigen"):
+            st.text_area("Markdown", report, height=320)
 
 
 if __name__ == "__main__":
