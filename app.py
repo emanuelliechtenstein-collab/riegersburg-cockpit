@@ -629,22 +629,58 @@ def clean_import_line(line: str) -> str:
     return re.sub(r"\s+", " ", line).strip()
 
 
-def split_import_candidates(body: str) -> list[tuple[str, bool]]:
+def split_import_candidates(body: str) -> list[tuple[str, bool, bool]]:
     candidates = []
+    action_section = False
+    action_heading_pattern = r"(empfehlungen|handlungsempfehlungen|nächste schritte|next steps|to-?dos?|maßnahmen|massnahmen|vorgehen|weiteres vorgehen|prioritäten|prioritaeten|roadmap|arbeitsprogramm)"
     for raw_line in repair_text_encoding(body).splitlines():
-        if not raw_line.strip():
+        stripped = raw_line.strip()
+        if not stripped:
             continue
+        heading_text = clean_import_line(stripped).strip(":").lower()
+        if re.fullmatch(action_heading_pattern, heading_text):
+            action_section = True
+            continue
+        if re.match(r"^#{1,4}\s+", stripped):
+            heading_text = clean_import_line(re.sub(r"^#{1,4}\s+", "", stripped)).strip(":").lower()
+            action_section = bool(re.search(action_heading_pattern, heading_text))
+            continue
+        if re.match(r"^[A-ZÄÖÜ][A-Za-zÄÖÜäöüß ]{3,45}:$", stripped) and not re.search(action_heading_pattern, heading_text):
+            action_section = False
+
         bullet_like = bool(re.match(r"^\s*[-*•\d.)\]]+", raw_line))
         if bullet_like:
-            candidates.append((raw_line, True))
+            candidates.append((raw_line, True, action_section))
             continue
-        for sentence in re.split(r"(?<=[.!?])\s+", raw_line.strip()):
+        for sentence in split_sentences(raw_line.strip()):
             if sentence:
-                candidates.append((sentence, False))
+                candidates.append((sentence, False, action_section))
     return candidates
 
 
-def task_candidate_is_useful(line: str, bullet_like: bool, action_words: list[str]) -> bool:
+def split_sentences(text_value: str) -> list[str]:
+    protected = repair_text_encoding(text_value)
+    abbreviations = {
+        "Dr.": "Dr<dot>",
+        "Mag.": "Mag<dot>",
+        "Dipl.": "Dipl<dot>",
+        "Ing.": "Ing<dot>",
+        "bzw.": "bzw<dot>",
+        "z.B.": "z<dot>B<dot>",
+        "u.a.": "u<dot>a<dot>",
+    }
+    for original, replacement in abbreviations.items():
+        protected = protected.replace(original, replacement)
+    sentences = re.split(r"(?<=[.!?])\s+", protected)
+    restored = []
+    for sentence in sentences:
+        for original, replacement in abbreviations.items():
+            sentence = sentence.replace(replacement, original)
+        restored.append(sentence)
+    return restored
+
+
+def task_candidate_is_useful(line: str, bullet_like: bool, action_section: bool, action_words: list[str]) -> bool:
     lowered = line.lower()
     if len(line) < 12:
         return False
@@ -653,6 +689,11 @@ def task_candidate_is_useful(line: str, bullet_like: bool, action_words: list[st
     if len(line.split()) > 34 and not bullet_like:
         return False
     soft_noise = [
+        "ausgangslage:",
+        "hintergrund:",
+        "kontext:",
+        "einordnung:",
+        "zusammenfassung:",
         "vielen dank",
         "herzlichen dank",
         "mit freundlichen grüßen",
@@ -668,6 +709,17 @@ def task_candidate_is_useful(line: str, bullet_like: bool, action_words: list[st
         return False
     strong_patterns = [
         r"\bbitte\b",
+        r"\bsollte[n]?\b",
+        r"\bsoll\b",
+        r"\bmuss\b",
+        r"\bmüssen\b",
+        r"\bempfiehlt\s+sich\b",
+        r"\bzu\s+empfehlen\b",
+        r"\bempfehlung\b",
+        r"\bhandlungsempfehlung\b",
+        r"\bmaßnahme\b",
+        r"\bmassnahme\b",
+        r"\bals\s+nächstes\b",
         r"\bbis\s+\d{1,2}\.",
         r"\bfrist\b",
         r"\bnächste[rs]?\s+schritt",
@@ -678,6 +730,10 @@ def task_candidate_is_useful(line: str, bullet_like: bool, action_words: list[st
     ]
     if any(re.search(pattern, lowered) for pattern in strong_patterns):
         return True
+    if action_section and any(word in lowered for word in action_words):
+        return True
+    if action_section and bullet_like and len(line.split()) >= 4:
+        return True
     if bullet_like and any(word in lowered for word in action_words):
         return True
     return False
@@ -685,7 +741,7 @@ def task_candidate_is_useful(line: str, bullet_like: bool, action_words: list[st
 
 def shorten_task_text(line: str) -> str:
     cleaned = clean_import_line(line)
-    first_sentence = re.split(r"(?<=[.!?])\s+", cleaned)[0]
+    first_sentence = split_sentences(cleaned)[0]
     if 20 <= len(first_sentence) <= 180:
         return first_sentence
     return cleaned[:180].rstrip(" ,.;")
@@ -712,9 +768,9 @@ def extract_deadline(text_value: str) -> str:
 
 def guess_priority(text_value: str) -> str:
     lowered = text_value.lower()
-    if any(word in lowered for word in ["dringend", "sofort", "kritisch", "frist", "bis morgen", "deadline", "eilt"]):
+    if any(word in lowered for word in ["dringend", "sofort", "kritisch", "frist", "bis morgen", "deadline", "eilt", "priorität hoch", "hohe priorität"]):
         return "hoch"
-    if any(word in lowered for word in ["prüfen", "klären", "vorbereiten", "nachfassen", "kontakt", "einreichen"]):
+    if any(word in lowered for word in ["prüfen", "klären", "vorbereiten", "nachfassen", "kontakt", "einreichen", "sichern", "empfehlung", "empfehlen", "empfohlen", "maßnahme", "nächster schritt", "sollte"]):
         return "mittel"
     return "niedrig"
 
@@ -748,8 +804,21 @@ def extract_task_suggestions(source_type: str, title: str, body: str, owner: str
     action_words = [
         "bitte",
         "soll",
+        "sollte",
+        "sollten",
         "muss",
         "müssen",
+        "empfehlung",
+        "empfohlen",
+        "empfiehlt",
+        "maßnahme",
+        "massnahme",
+        "maßnahmen",
+        "massnahmen",
+        "vorgehen",
+        "strategie",
+        "priorität",
+        "prioritaet",
         "klären",
         "prüfen",
         "vorbereiten",
@@ -761,6 +830,7 @@ def extract_task_suggestions(source_type: str, title: str, body: str, owner: str
         "abstimmen",
         "entscheiden",
         "organisieren",
+        "sichern",
         "termin",
         "nächste",
         "to do",
@@ -769,9 +839,9 @@ def extract_task_suggestions(source_type: str, title: str, body: str, owner: str
     ]
     rows = []
     seen = set()
-    for raw_line, bullet_like in split_import_candidates(body):
+    for raw_line, bullet_like, action_section in split_import_candidates(body):
         line = clean_import_line(raw_line)
-        if not task_candidate_is_useful(line, bullet_like, action_words):
+        if not task_candidate_is_useful(line, bullet_like, action_section, action_words):
             continue
         task_text = shorten_task_text(line)
         if task_text.lower() in seen:
@@ -957,6 +1027,132 @@ def protocol_summary(title: str, protocol_date: str, participants: str, body: st
             lines.append(f"- {row['Aufgabe']} | verantwortlich: {row['Verantwortlich']} | Frist: {row['Frist']}")
     lines.extend(["", "## Textauszug", "", body[:2500]])
     return "\n".join(lines)
+
+
+def parse_pipe_values(line: str) -> list[str]:
+    cleaned = clean_import_line(line)
+    if "|" in cleaned:
+        return [part.strip() for part in cleaned.split("|")]
+    if ";" in cleaned:
+        return [part.strip() for part in cleaned.split(";")]
+    return [cleaned]
+
+
+def parse_chatgpt_structured_output(text_value: str, default_owner: str, existing_funding: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, str]:
+    sections: dict[str, list[str]] = {"aufgaben": [], "kontakte": [], "foerderhinweise": [], "statusnotiz": []}
+    section = ""
+    section_aliases = {
+        "aufgaben": "aufgaben",
+        "todo": "aufgaben",
+        "todos": "aufgaben",
+        "to-dos": "aufgaben",
+        "kontakte": "kontakte",
+        "ansprechpartner": "kontakte",
+        "förderhinweise": "foerderhinweise",
+        "foerderhinweise": "foerderhinweise",
+        "förderlinien": "foerderhinweise",
+        "foerderlinien": "foerderhinweise",
+        "statusnotiz": "statusnotiz",
+        "status": "statusnotiz",
+        "lage": "statusnotiz",
+    }
+
+    for raw_line in repair_text_encoding(text_value).splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        heading = clean_import_line(re.sub(r"^#{1,4}\s*", "", line)).strip(":").lower()
+        if heading in section_aliases:
+            section = section_aliases[heading]
+            continue
+        if not section:
+            continue
+        sections[section].append(line)
+
+    task_rows = []
+    for line in sections["aufgaben"]:
+        values = parse_pipe_values(line)
+        task_text = values[0] if values else ""
+        if not task_text:
+            continue
+        task_rows.append(
+            {
+                "Aufgabe": task_text,
+                "Verantwortlich": values[1] if len(values) > 1 and values[1] else default_owner,
+                "Priorität": values[2].lower() if len(values) > 2 and values[2].lower() in PRIORITIES else guess_priority(task_text),
+                "Status": "offen",
+                "Frist": values[3] if len(values) > 3 else extract_deadline(task_text),
+                "Bezug zu Förderstelle": values[4] if len(values) > 4 else guess_funding_reference(task_text, existing_funding),
+                "Notizen": values[5] if len(values) > 5 else "Übernommen aus ChatGPT-Ergebnis",
+            }
+        )
+
+    contact_rows = []
+    for line in sections["kontakte"]:
+        values = parse_pipe_values(line)
+        name = values[0] if values else ""
+        if not name:
+            continue
+        contact_rows.append(
+            {
+                "Name": name,
+                "Organisation": values[1] if len(values) > 1 else "",
+                "Funktion": values[2] if len(values) > 2 else "",
+                "E-Mail": values[3] if len(values) > 3 else "",
+                "Telefon": values[4] if len(values) > 4 else "",
+                "Relevanz": values[5].lower() if len(values) > 5 and values[5].lower() in RELEVANCE else "mittel",
+                "letzte Kontaktaufnahme": date.today().isoformat(),
+                "nächste Aktion": values[6] if len(values) > 6 else "",
+                "Notizen": values[7] if len(values) > 7 else "Übernommen aus ChatGPT-Ergebnis",
+            }
+        )
+
+    funding_rows = []
+    for line in sections["foerderhinweise"]:
+        values = parse_pipe_values(line)
+        name = values[0] if values else ""
+        if not name:
+            continue
+        funding_rows.append(
+            {
+                "Name": name,
+                "Ebene": values[1] if len(values) > 1 and values[1] in LEVELS else "",
+                "zuständige Stelle": values[2] if len(values) > 2 else "",
+                "Ansprechpartner": values[3] if len(values) > 3 else "",
+                "thematische Eignung": values[4] if len(values) > 4 else "",
+                "geschätztes Förderpotenzial": values[5] if len(values) > 5 else "",
+                "Status": values[6] if len(values) > 6 else "in Prüfung",
+                "nächste Aktion": values[7] if len(values) > 7 else "",
+                "Frist": values[8] if len(values) > 8 else extract_deadline(line),
+                "Notizen": values[9] if len(values) > 9 else "Übernommen aus ChatGPT-Ergebnis",
+            }
+        )
+
+    status_note = "\n".join(clean_import_line(line) for line in sections["statusnotiz"])
+    return (
+        pd.DataFrame(task_rows, columns=TASK_COLUMNS),
+        pd.DataFrame(contact_rows, columns=CONTACT_COLUMNS),
+        pd.DataFrame(funding_rows, columns=FUNDING_COLUMNS),
+        status_note,
+    )
+
+
+def chatgpt_import_template() -> str:
+    return """Bitte fasse unser Gespräch für das Riegersburg-Cockpit exakt in diesem Format zusammen:
+
+## Statusnotiz
+Ein kurzer Absatz zum aktuellen Stand.
+
+## Aufgaben
+- Aufgabe | Verantwortlich | Priorität | Frist | Bezug zu Förderstelle | Notizen
+
+## Kontakte
+- Name | Organisation | Funktion | E-Mail | Telefon | Relevanz | nächste Aktion | Notizen
+
+## Förderhinweise
+- Name | Ebene | zuständige Stelle | Ansprechpartner | thematische Eignung | geschätztes Förderpotenzial | Status | nächste Aktion | Frist | Notizen
+
+Bitte nur konkrete, übernehmbare Punkte eintragen. Keine langen Erklärtexte."""
 
 
 def markdown_report(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFrame) -> str:
@@ -1238,7 +1434,7 @@ def import_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFr
     st.subheader("E-Mails und Protokolle importieren")
     st.caption("Die App erstellt Vorschläge. Gespeichert wird erst, wenn ihr die Vorschläge bestätigt.")
 
-    mail_tab, protocol_tab = st.tabs(["E-Mail", "Protokoll / Plaud"])
+    mail_tab, protocol_tab, chatgpt_tab = st.tabs(["E-Mail", "Protokoll / Plaud", "ChatGPT-Ergebnis"])
 
     with mail_tab:
         uploaded_email = st.file_uploader("E-Mail-Datei hochladen", type=["eml", "txt"], key="mail_upload")
@@ -1388,6 +1584,58 @@ def import_panel(funding: pd.DataFrame, tasks: pd.DataFrame, contacts: pd.DataFr
                 for fingerprint, source_title in st.session_state.get("protocol_fingerprints", []):
                     record_import(fingerprint, "Protokoll", source_title, "Kontakte gespeichert")
                 st.success("Kontakte aus Protokoll gespeichert.")
+                st.rerun()
+
+    with chatgpt_tab:
+        st.caption("Für beste Ergebnisse ChatGPT zuerst mit der Vorlage unten antworten lassen und die Antwort hier einfügen.")
+        st.code(chatgpt_import_template(), language="markdown")
+        chatgpt_text = st.text_area("ChatGPT-Ergebnis hier einfügen", height=320, key="chatgpt_result_raw")
+        chatgpt_owner = st.text_input("Standard-Verantwortlich", value="Projektteam", key="chatgpt_owner")
+
+        if st.button("ChatGPT-Ergebnis auswerten", type="primary"):
+            if not chatgpt_text.strip():
+                st.warning("Bitte zuerst das strukturierte ChatGPT-Ergebnis einfügen.")
+            else:
+                parsed_tasks, parsed_contacts, parsed_funding, status_note = parse_chatgpt_structured_output(chatgpt_text, chatgpt_owner, funding)
+                st.session_state["chatgpt_task_suggestions"] = parsed_tasks
+                st.session_state["chatgpt_contact_suggestions"] = parsed_contacts
+                st.session_state["chatgpt_funding_suggestions"] = parsed_funding
+                st.session_state["chatgpt_status_note"] = status_note
+                st.success(
+                    f"Erkannt: {len(parsed_tasks)} Aufgabe(n), "
+                    f"{len(parsed_contacts)} Kontakt(e), {len(parsed_funding)} Förderhinweis(e)."
+                )
+
+        status_note = st.session_state.get("chatgpt_status_note", "")
+        if status_note:
+            st.markdown("**Statusnotiz**")
+            st.write(status_note)
+
+        chatgpt_tasks = st.session_state.get("chatgpt_task_suggestions", pd.DataFrame(columns=TASK_COLUMNS))
+        chatgpt_contacts = st.session_state.get("chatgpt_contact_suggestions", pd.DataFrame(columns=CONTACT_COLUMNS))
+        chatgpt_funding = st.session_state.get("chatgpt_funding_suggestions", pd.DataFrame(columns=FUNDING_COLUMNS))
+
+        if not chatgpt_tasks.empty:
+            edited_chatgpt_tasks = data_editor("Aufgaben aus ChatGPT", chatgpt_tasks, TASK_COLUMNS, "chatgpt_tasks_editor", {"Priorität": PRIORITIES, "Status": TASK_STATUS})
+            if st.button("Aufgaben aus ChatGPT speichern"):
+                save_table(TASKS_FILE, append_unique(tasks, edited_chatgpt_tasks, "Aufgabe"), TASK_COLUMNS)
+                st.success("Aufgaben aus ChatGPT gespeichert.")
+                st.rerun()
+        else:
+            st.info("Noch keine Aufgaben aus ChatGPT erkannt.")
+
+        if not chatgpt_contacts.empty:
+            edited_chatgpt_contacts = data_editor("Kontakte aus ChatGPT", chatgpt_contacts, CONTACT_COLUMNS, "chatgpt_contacts_editor", {"Relevanz": RELEVANCE})
+            if st.button("Kontakte aus ChatGPT speichern"):
+                save_table(CONTACTS_FILE, append_unique(contacts, edited_chatgpt_contacts, "Name"), CONTACT_COLUMNS)
+                st.success("Kontakte aus ChatGPT gespeichert.")
+                st.rerun()
+
+        if not chatgpt_funding.empty:
+            edited_chatgpt_funding = data_editor("Förderhinweise aus ChatGPT", chatgpt_funding, FUNDING_COLUMNS, "chatgpt_funding_editor", {"Ebene": LEVELS, "Status": FUNDING_STATUS})
+            if st.button("Förderhinweise aus ChatGPT speichern"):
+                save_table(FUNDING_FILE, append_unique(funding, edited_chatgpt_funding, "Name"), FUNDING_COLUMNS)
+                st.success("Förderhinweise aus ChatGPT gespeichert.")
                 st.rerun()
 
     with st.expander("Import-Historie"):
