@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -100,6 +101,10 @@ def read_text(path: Path) -> str:
 
 
 def fingerprint_for(path: Path, content: str) -> str:
+    message_match = re.search(r"(?im)^(?:Message-ID|Apple-Mail-ID):\s*(.+)$", content)
+    if message_match:
+        normalized_message_id = " ".join(message_match.group(1).split()).lower()
+        return hashlib.sha256(f"mail:{normalized_message_id}".encode("utf-8")).hexdigest()
     normalized = "\n".join([path.name.lower(), " ".join(content.split()).lower()])
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
